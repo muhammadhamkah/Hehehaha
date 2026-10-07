@@ -14,3 +14,4 @@ runs/
 runs_*.log
 validation_report.json
 runs_real.sh
+data/arch_*/
