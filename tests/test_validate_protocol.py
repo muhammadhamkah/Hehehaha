@@ -84,3 +84,22 @@ def test_daily_window_shards():
                                             d + DAY_MS + 17 * 3_600_000)]
     r2 = Runner("x", "o", {}, [], 120_000, 1)
     assert r2.shards(d, d + DAY_MS)[0] == (d, d + 120_000, d + DAY_MS)
+
+
+def test_resume_reuses_only_identical_shards(tmp_path):
+    import json as _json
+
+    from config import BotConfig
+    from research.validate import Runner
+
+    cfg = BotConfig()
+    d = tmp_path / "shard"
+    d.mkdir()
+    spec = {"out_dir": str(d), "start_ms": 1, "end_ms": 2, "warmup_ms": 3, "symbols": ["A"], "events_dir": "e"}
+    (d / "result.json").write_text(_json.dumps({"label": "L", "spec": spec, "config_hash": cfg.fingerprint()}))
+    assert Runner._reusable((cfg, spec, "L")) is not None
+    assert Runner._reusable((cfg, spec, "other")) is None
+    assert Runner._reusable((cfg, {**spec, "end_ms": 9}, "L")) is None
+    changed = BotConfig()
+    changed.entry.stop_bps = 99
+    assert Runner._reusable((changed, spec, "L")) is None

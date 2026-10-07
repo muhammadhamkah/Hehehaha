@@ -314,6 +314,15 @@ class BotConfig:
             )
         return problems
 
+    def fingerprint(self) -> str:
+        """Stable hash of everything that can change trading behaviour (not secrets/paths)."""
+        import hashlib
+
+        d = self.to_dict()
+        for k in ("recorder", "exchange", "log_level"):
+            d.pop(k, None)
+        return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["exchange"]["api_key"] = "***" if self.exchange.api_key else ""

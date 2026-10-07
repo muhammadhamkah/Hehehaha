@@ -111,6 +111,7 @@ def run_replay(cfg: BotConfig, spec: ReplaySpec) -> dict[str, Any]:
     if os.path.exists(jl):
         os.remove(jl)
     meta = load_meta(spec.events_dir)
+    input_hash = cfg.fingerprint()       # of the caller's config, before replay adjustments
     cfg = _prepare_config(cfg, spec, meta)
     problems = [p for p in cfg.validate() if "live" not in p]
     if problems:
@@ -186,6 +187,7 @@ def run_replay(cfg: BotConfig, spec: ReplaySpec) -> dict[str, Any]:
     if min_edge_obs is not None:
         min_edge_obs.frame().to_csv(os.path.join(spec.out_dir, "min_edge.csv"), index=False)
     result = summarize(db_path, bot, stats, reader, spec, active_from, wall0)
+    result["config_hash"] = input_hash
     with open(os.path.join(spec.out_dir, "result.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=1, default=str)
     return result

@@ -31,7 +31,6 @@ for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
 
 import argparse
 import copy
-import hashlib
 import itertools
 import json
 import logging
@@ -98,10 +97,7 @@ def apply(cfg: BotConfig, overrides: dict[str, Any]) -> BotConfig:
 
 
 def config_hash(cfg: BotConfig) -> str:
-    d = cfg.to_dict()
-    for k in ("recorder", "exchange", "log_level"):
-        d.pop(k, None)
-    return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return cfg.fingerprint()
 
 
 def split_bounds(t0: int, t1: int, fractions: tuple[float, float, float]) -> dict[str, tuple[int, int]]:
@@ -211,7 +207,9 @@ class Runner:
     """Expands segment runs into day shards, executes all shards in one process pool."""
 
     def __init__(self, events: str, out: str, bounds: dict[str, tuple[int, int]], symbols: list[str],
-                 warmup_ms: int, workers: int, daily_window: tuple[int, int] | None = None) -> None:
+                 warmup_ms: int, workers: int, daily_window: tuple[int, int] | None = None,
+                 resume: bool = False) -> None:
+        self.resume = resume
         self.events, self.out, self.bounds = events, out, bounds
         self.symbols, self.warmup_ms, self.workers = symbols, warmup_ms, workers
         self.daily_window = daily_window       # (start_hour, end_hour) UTC, or None = whole day
@@ -231,6 +229,25 @@ class Runner:
                 out.append((a, start, b))
         return out
 
+    @staticmethod
+    def _reusable(job: tuple) -> dict[str, Any] | None:
+        """A completed shard is reused only if its spec, label and (when stored) config match."""
+        cfg, spec, label = job
+        path = os.path.join(spec["out_dir"], "result.json")
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            r = json.load(fh)
+        old = r.get("spec", {})
+        same = (r.get("label") == label and all(old.get(k) == spec.get(k) for k in
+                ("start_ms", "end_ms", "warmup_ms", "symbols", "events_dir"))
+                and r.get("config_hash", cfg.fingerprint()) == cfg.fingerprint())
+        if not same:
+            return None
+        log.info("reusing completed shard %s", spec["out_dir"])
+        r["_wall"] = 0.0
+        return r
+
     def run(self, requests: list[tuple[BotConfig, str, str, str, dict]]) -> list[dict[str, Any]]:
         """requests: (cfg, segment, sub_dir, label, extra ReplaySpec kwargs)."""
         jobs, groups = [], []
@@ -245,8 +262,12 @@ class Runner:
                 idx.append(len(jobs))
                 jobs.append((cfg, spec, label))
             groups.append(idx)
-        log.info("running %d shard replays (%d requests, workers=%d)", len(jobs), len(requests), self.workers)
-        results = run_many(jobs, self.workers)
+        results: list[dict[str, Any] | None] = [self._reusable(j) if self.resume else None for j in jobs]
+        todo = [i for i, r in enumerate(results) if r is None]
+        log.info("running %d shard replays (%d reused, %d requests, workers=%d)", len(todo),
+                 len(jobs) - len(todo), len(requests), self.workers)
+        for i, r in zip(todo, run_many([jobs[i] for i in todo], self.workers) if todo else []):
+            results[i] = r
         return [merge_shards([jobs[i][1]["out_dir"] for i in g], [results[i] for i in g]) for g in groups]
 
 
@@ -272,7 +293,7 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
              workers: int, symbols: list[str], fractions=(0.6, 0.2, 0.2), top_k: int = 5,
              min_trades: int = 30, final_test: bool = False, force_retest: bool = False,
              latencies: list[int] = LATENCIES, warmup_ms: int = 120_000,
-             daily_window: tuple[int, int] | None = None) -> dict[str, Any]:
+             daily_window: tuple[int, int] | None = None, resume: bool = False) -> dict[str, Any]:
     import pandas as pd
 
     from research import analysis as A
@@ -293,7 +314,7 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
                               "daily_window_utc": daily_window}
     base = copy.deepcopy(cfg)
     base.execution.sim_latency_ms = PRIMARY_LATENCY
-    R = Runner(events, out, bounds, symbols, warmup_ms, workers, daily_window)
+    R = Runner(events, out, bounds, symbols, warmup_ms, workers, daily_window, resume)
 
     # -- 2. baseline (research recording) + 3. sweep, all on TRAIN, in one pool
     cands = combos(grid, max_combos) if grid else []     # empty grid: research-only run
@@ -451,6 +472,8 @@ def main() -> None:
                     help="baseline analyses on TRAIN only (features, calibration, min edge); no sweep/test")
     ap.add_argument("--daily-window", nargs=2, type=int, metavar=("START_H", "END_H"),
                     help="replay only this UTC hour window of each day (compute-limited studies)")
+    ap.add_argument("--resume", action="store_true",
+                    help="reuse completed shard results with identical spec/label/config")
     ap.add_argument("--final-test", action="store_true")
     ap.add_argument("--force-retest", action="store_true")
     args = ap.parse_args()
@@ -466,7 +489,8 @@ def main() -> None:
             grid = json.load(fh)
     rep = validate(cfg, args.events, args.out, grid, args.max_combos, args.workers, args.symbols,
                    tuple(args.split), args.top_k, args.min_trades, args.final_test, args.force_retest,
-                   args.latencies, daily_window=tuple(args.daily_window) if args.daily_window else None)
+                   args.latencies, daily_window=tuple(args.daily_window) if args.daily_window else None,
+                   resume=args.resume)
     print(f"\nVERDICT: {rep['verdict']}\nreport: {os.path.join(args.out, 'VALIDATION_REPORT.md')}")
 
 
