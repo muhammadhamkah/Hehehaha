@@ -240,6 +240,7 @@ def summarize(db_path: str, bot, stats: dict, reader, spec: ReplaySpec,
     perf = performance_with_extras(trades)
     span_ms = max(stats.get("last_ts", active_from) - active_from, 0)
     return {
+        "research_only": bool(bot.cfg.risk.research_mode),
         "label": spec.label,
         "spec": _spec_dict(spec),
         "period": {"from": _iso(active_from), "to": _iso(stats.get("last_ts", active_from)),

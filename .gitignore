@@ -15,3 +15,6 @@ runs_*.log
 validation_report.json
 runs_real.sh
 data/arch_*/
+data/v2/
+v2_dataset.log
+models/v2/

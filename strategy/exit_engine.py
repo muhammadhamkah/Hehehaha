@@ -118,6 +118,14 @@ class ExitEngine:
         pos.mfe_bps = max(pos.mfe_bps, pnl)
         pos.mae_bps = min(pos.mae_bps, pnl)
         held_s = (now_ms - pos.entry_ts_ms) / 1000.0
+        if x.mode == "barrier":
+            if pnl >= pos.plan.target_bps:
+                return ExitSignal("target_profit")
+            if pnl <= -pos.plan.stop_bps:
+                return ExitSignal("stop_loss")
+            if held_s >= pos.plan.horizon_s:
+                return ExitSignal("time_stop")
+            return None
         be = self.break_even_bps(pos)
 
         # --- ratchet the stop (never loosens)

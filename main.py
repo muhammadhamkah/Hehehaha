@@ -41,9 +41,10 @@ from exchange.execution import ExchangeAdapter, LiveExchange, PaperExchange, Tra
 from exchange.models import Order, SymbolInfo
 from exchange.schemas import FeedValidator
 from exchange.websocket_manager import StreamConnection, UserDataStream
-from market_data.orderbook import OrderBook, SyncStatus
+from market_data.orderbook import OrderBook
 from market_data.scanner import MarketScanner
-from market_data.tradeflow import Trade, TradeFlow
+from market_data.state import apply_detail, make_book
+from market_data.tradeflow import TradeFlow
 from risk.risk_manager import RiskManager
 from strategy.costs import CostModel
 from strategy.entry_filter import EntryFilter
@@ -102,7 +103,12 @@ class TradingBot:
         self.costs = CostModel(cfg.costs)
         self.predictor = build_predictor(cfg.strategy)
         self.entry_filter = EntryFilter(cfg, self.costs)
-        self.signals = SignalEngine(cfg, self.predictor, self.entry_filter, self.recorder, self.risk)
+        if cfg.strategy.predictor == "v2":
+            from strategy.v2 import SignalEngineV2
+
+            self.signals = SignalEngineV2(cfg, self.costs, self.recorder, self.risk, cfg.strategy.v2_model_dir)
+        else:
+            self.signals = SignalEngine(cfg, self.predictor, self.entry_filter, self.recorder, self.risk)
         self.exit_engine = ExitEngine(cfg, self.costs.maker_fee, self.costs.taker_fee)
 
         self.adapter: ExchangeAdapter
@@ -159,6 +165,8 @@ class TradingBot:
         problems = self.cfg.validate()
         if problems:
             raise SystemExit("config problems:\n  " + "\n  ".join(problems))
+        if self.cfg.risk.research_mode:
+            raise SystemExit("risk.research_mode is RESEARCH-ONLY and refused outside offline replay")
         log.info("mode=%s dry_run=%s live_orders=%s trading=%s", self.cfg.mode, self.cfg.dry_run,
                  self.live, self.trading)
         if self.cfg.mode == "live" and not self.live:
@@ -260,43 +268,14 @@ class TradingBot:
         flow = self.flows.get(symbol)
         if book is None or flow is None:
             return  # late message for a symbol we just unsubscribed from
-        mode = self.cfg.market_data.depth_mode
-        if kind == "aggTrade":
-            pt = self.feed.agg_trade(stream, data, ts, symbol)
-            if pt is None:
-                return
-            t = Trade(pt.trade_ts, pt.price, pt.qty, pt.is_buyer_maker)
-            flow.add(t, ts, pt.agg_id)
+        res = apply_detail(book, flow, self.feed, self.cfg.market_data.depth_mode, symbol, kind, stream, data, ts)
+        if res.kind == "trade":
             if isinstance(self.adapter, PaperExchange):
-                self.adapter.on_trade(symbol, t)
+                self.adapter.on_trade(symbol, res.trade)
             return
-        if kind.startswith("depth"):
-            pd_ = self.feed.depth(stream, data, ts, symbol, partial=(mode == "partial"))
-            if pd_ is None:
-                return
-            if mode == "partial":
-                book.apply_snapshot(pd_.bids, pd_.asks, pd_.final_id, pd_.event_ts, ts)
-            elif mode == "diff":
-                status = book.apply_diff(data, ts)
-                if status == SyncStatus.RESYNC or status == SyncStatus.BUFFERING:
-                    if status == SyncStatus.RESYNC:
-                        book.last_update_id = 0
-                        book.buffer_diff(data)
-                    self._schedule_resync(symbol)
-            else:
-                self.feed.report_unexpected(stream, "depth message in bbo mode")
-                return
-        elif kind == "bookTicker":
-            bt = self.feed.book_ticker(stream, data, ts, symbol)
-            if bt is None:
-                return
-            if mode == "bbo":
-                # L1-only data (e.g. Binance public archive): top of book IS the book.
-                book.apply_snapshot([(bt.bid, bt.bid_qty)], [(bt.ask, bt.ask_qty)], bt.update_id, bt.event_ts, ts)
-            else:
-                book.update_bbo(bt.bid, bt.bid_qty, bt.ask, bt.ask_qty, ts)
-        else:
-            self.feed.report_unexpected(stream, data)
+        if res.kind == "resync":
+            self._schedule_resync(symbol)   # (falls through, as before the refactor)
+        elif res.kind != "book":
             return
         bid, _, ask, _ = book.best()
         self.recorder.on_quote(symbol, ts, bid, ask)
@@ -361,8 +340,7 @@ class TradingBot:
             for s in active:
                 if s not in self.books:
                     md = self.cfg.market_data
-                    self.books[s] = OrderBook(s, md.book_history_len, history_interval_ms=(
-                        md.bbo_history_interval_ms if md.depth_mode == "bbo" else 0))
+                    self.books[s] = make_book(s, md.book_history_len, md.depth_mode, md.bbo_history_interval_ms)
                     self.flows[s] = TradeFlow(s, self.cfg.market_data.trade_history_s)
             for s in list(self.books):
                 if s not in active and s not in self.positions:
@@ -419,7 +397,7 @@ class TradingBot:
                     self._start_exit(pos, "emergency_no_data", True)
                     continue
                 f = self.signals.features(book, flow, now)
-                pred = self.predictor.predict(f) if f else None
+                pred = self.predictor.predict(f) if f and self.cfg.exit.mode == "v1" else None
                 bid, _, ask, _ = book.best()
                 sig = self.exit_engine.update(pos, bid, ask, f, pred, now)
                 if sig is not None:

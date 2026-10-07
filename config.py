@@ -108,7 +108,9 @@ class FeatureConfig:
 
 @dataclass
 class StrategyConfig:
-    predictor: str = "rule"               # "rule" or "linear"
+    predictor: str = "rule"               # "rule" (V1), "linear" (V1 + trained linear) or "v2"
+    v2_model_dir: str = "models/v2/lightgbm"
+    v2_threshold: float | None = None     # None -> threshold selected during model research
     model_path: str = "models/linear_model.json"
     eval_interval_ms: int = 250
     # Rule-based score weights
@@ -194,6 +196,10 @@ class ExecutionConfig:
 
 @dataclass
 class ExitConfig:
+    # "v1": break-even / trailing / flow-reversal / imbalance / exhaustion / time exits
+    # "barrier": exactly the economics V2 is trained on -- TP at target, SL at stop,
+    #            time stop at strategy.max_hold_s (+ emergencies)
+    mode: str = "v1"
     # Break-even arms at max(trigger, net-break-even + buffer) so it never stops out instantly.
     break_even_trigger_bps: float = 10.0
     break_even_buffer_bps: float = 2.0
@@ -222,6 +228,9 @@ class RiskConfig:
     api_error_window_s: float = 60.0
     disconnect_halt_s: float = 10.0
     kill_switch_file: str = "KILL_SWITCH"
+    # RESEARCH-ONLY: ignore the consecutive-loss halt so offline replays can observe the
+    # full distribution of a losing strategy. Refused by the bot outside offline replay.
+    research_mode: bool = False
 
 
 @dataclass
@@ -292,6 +301,10 @@ class BotConfig:
             problems.append("execution.entry_mode must be 'maker_first' or 'taker'")
         if self.market_data.depth_mode not in ("partial", "diff", "bbo"):
             problems.append("market_data.depth_mode must be 'partial', 'diff' or 'bbo'")
+        if self.exit.mode not in ("v1", "barrier"):
+            problems.append("exit.mode must be 'v1' or 'barrier'")
+        if self.strategy.predictor == "v2" and self.mode == "live":
+            problems.append("V2 predictor is not approved for live trading (no credible out-of-sample edge yet)")
         if self.entry.min_net_profit_usdt <= 0:
             problems.append("entry.min_net_profit_usdt must be positive")
         if self.mode == "live" and not self.dry_run and not self.live_trading_enabled():
