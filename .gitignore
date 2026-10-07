@@ -7,3 +7,9 @@ models/*.json
 KILL_SWITCH
 .env
 *.log
+data/archive_raw/
+data/archive_events/
+data/events/
+runs/
+runs_*.log
+validation_report.json

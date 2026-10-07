@@ -352,7 +352,9 @@ class TradingBot:
             active = self.scanner.select(now)
             for s in active:
                 if s not in self.books:
-                    self.books[s] = OrderBook(s, self.cfg.market_data.book_history_len)
+                    md = self.cfg.market_data
+                    self.books[s] = OrderBook(s, md.book_history_len, history_interval_ms=(
+                        md.bbo_history_interval_ms if md.depth_mode == "bbo" else 0))
                     self.flows[s] = TradeFlow(s, self.cfg.market_data.trade_history_s)
             for s in list(self.books):
                 if s not in active and s not in self.positions:

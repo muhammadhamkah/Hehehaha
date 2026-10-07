@@ -86,6 +86,9 @@ class MarketDataConfig:
     depth_levels: int = 20
     diff_snapshot_limit: int = 1000
     book_history_len: int = 600          # ~60s at 100ms
+    # bbo (tick-level L1) mode conflates book history into buckets of this size so the
+    # history covers the same ~60s as depth20@100ms; partial/diff modes record every update.
+    bbo_history_interval_ms: int = 100
     trade_history_s: float = 120.0
     stale_after_ms: int = 2000
 
