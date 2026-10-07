@@ -179,3 +179,37 @@ def test_compare_runner_and_test_lock(v2_setup, tmp_path, monkeypatch):
     base.write_text(json.dumps({"entry": {"min_net_profit_usdt": 0.02, "min_depth_usdt_within_10bps": 0.0}}))
     with pytest.raises(SystemExit):
         C.main()
+
+
+def test_twostage_serving_matches_research(v2_setup, tmp_path):
+    """Stage A -> Stage B -> combined calibration: served predictions equal the research ones."""
+    from research import v2_twostage as TS
+    from research.v2_dataset import load_dataset
+    from strategy.v2 import TwoStageModel, load_v2_model
+
+    ev, ds, out, rep = v2_setup
+    tr, ca, se = (load_dataset(ds, [d]) for d in DAYS)
+    cols = feature_columns(tr)
+    xtr, xca, xse = matrix(tr, cols), matrix(ca, cols), matrix(se, cols)
+    T = 8
+    a = TS.stage_a("lightgbm", tr, ca, se, xtr, xca, xse, T, 60, 2)
+    b = TS.stage_b("lightgbm", tr, ca, se, xtr, xca, xse, T, 60, 2, min_pop=(20, 5, 5))
+    assert a is not None and b is not None and 0 <= a["metrics"]["base_rate"] <= 1
+    A, B = {T: a}, {T: b}
+    calib = TS.fit_combo_calib(A, B, ca, xca, [T], 8)
+    a_thr = {T: float(np.quantile(a["p_ca"], 0.5))}
+    sel = {"targets": [T], "b_thr": 0.5, "a_thr": a_thr, "calib": calib, "selected": {"trades": 0}}
+    d = TS.export_twostage(str(tmp_path), "lightgbm", cols, A, B, sel, 8, 150.0, 0.1)
+    served = load_v2_model(d)
+    assert isinstance(served, TwoStageModel)
+    research = TS.combined_probs(A, B, xse, a_thr, 0.5, {T: calib[T].predict}, [T])
+    for i, r in enumerate(se[cols].to_dict("records")[:60]):
+        got = served.predict(r)
+        for side in ("long", "short"):
+            assert abs(got.get((side, T), 0.0) - research[(side, T)][i]) < 1e-6
+        if not got:
+            assert served.last_reject in ("stage_a_no_large_move", "stage_b_direction_weak")
+    assert TS.feature_kind("rmean_ofi_3s_1000ms") == "signed"
+    assert TS.feature_kind("rv_1s_bps") == "intensity"
+    assert TS.feature_kind("rmax_spread_bps_3000ms") == "intensity"
+    assert TS.feature_kind("bid_depth_5bps") == "side_pair"

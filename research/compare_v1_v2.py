@@ -86,6 +86,7 @@ def main() -> None:
     ap.add_argument("--window", nargs=2, type=int, default=[13, 17])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--final-test", action="store_true")
+    ap.add_argument("--no-v1", action="store_true", help="omit the V1 baseline (its test result is already locked)")
     ap.add_argument("--latency-json", help="model study report (for the inference-latency column)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -101,7 +102,7 @@ def main() -> None:
         for k in ("exchange", "recorder", "mode", "dry_run", "log_level"):
             d.pop(k, None)
         _merge(v1, d)
-    configs: dict[str, BotConfig] = {"V1 rule-based": v1}
+    configs: dict[str, BotConfig] = {} if args.no_v1 else {"V1 rule-based": v1}
     for kind in args.kinds:
         md = os.path.join(args.v2_models, kind)
         if os.path.exists(os.path.join(md, "spec.json")):

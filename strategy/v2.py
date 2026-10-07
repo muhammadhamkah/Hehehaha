@@ -77,7 +77,8 @@ class V2Model:
             b = xgb.Booster()
             b.load_model(os.path.join(d, entry["file"]))
             b.set_param({"nthread": 1})
-            return lambda x: float(b.inplace_predict(x)[0])
+            rng = (0, int(entry.get("best_iteration", -1)) + 1) if "best_iteration" in entry else (0, 0)
+            return lambda x: float(b.inplace_predict(x, iteration_range=rng)[0])
         p = entry["params"]
         med, mu, sd = np.array(p["med"]), np.array(p["mu"]), np.array(p["sd"])
         if self.kind == "logistic":
@@ -108,6 +109,57 @@ class V2Model:
         return {k: cal(fn(x)) for k, (fn, cal) in self._fns.items()}
 
 
+class TwoStageModel:
+    """Research model from research.v2_twostage: Stage A P(|move| >= T bps within 60 s), then --
+    only where Stage A passes its threshold -- Stage B P(UP | large move). The predicted side
+    gets the calibrated P(TP first) of the combined score; the other side gets nothing."""
+
+    def __init__(self, model_dir: str) -> None:
+        with open(os.path.join(model_dir, "spec.json"), encoding="utf-8") as fh:
+            self.spec = spec = json.load(fh)
+        self.kind = f"twostage_{spec['base']}"
+        self.features: list[str] = spec["features"]
+        self.stop_bps: int = spec["stop_bps"]
+        self.threshold: float = spec["threshold"]
+        self.b_thr: float = spec["b_thr"]
+        self.targets = [int(t) for t in spec["targets"]]
+        self.keys = [(s, t) for t in self.targets for s in ("long", "short")]
+        loader = V2Model.__new__(V2Model)
+        loader.kind = spec["base"]
+        self._a = {t: loader._load(model_dir, spec["stage_a"][str(t)]) for t in self.targets}
+        self._b = {t: (loader._load(model_dir, spec["stage_b"][str(t)]), _Calib(spec["stage_b"][str(t)]["calibrator"]))
+                   for t in self.targets}
+        self._c = {t: _Calib(spec["combo_calib"][str(t)]) for t in self.targets}
+        self.a_thr = {t: float(spec["a_thr"][str(t)]) for t in self.targets}
+        self.last_reject = ""
+
+    vector = V2Model.vector
+
+    def predict(self, f: dict[str, float]) -> dict[tuple[str, int], float]:
+        x = self.vector(f)
+        out: dict[tuple[str, int], float] = {}
+        any_a = False
+        for t in self.targets:
+            pa = self._a[t](x)
+            if pa < self.a_thr[t]:
+                continue
+            any_a = True
+            fn, cal = self._b[t]
+            pb = cal(fn(x))
+            conf = max(pb, 1 - pb)
+            if conf < self.b_thr:
+                continue
+            out[("long" if pb >= 0.5 else "short", t)] = self._c[t](pa * conf)
+        self.last_reject = "" if out else ("stage_b_direction_weak" if any_a else "stage_a_no_large_move")
+        return out
+
+
+def load_v2_model(model_dir: str):
+    with open(os.path.join(model_dir, "spec.json"), encoding="utf-8") as fh:
+        kind = json.load(fh)["kind"]
+    return TwoStageModel(model_dir) if kind == "twostage" else V2Model(model_dir)
+
+
 # ====================================================================== entry gate
 @dataclass
 class V2Choice:
@@ -119,7 +171,7 @@ class V2Choice:
 
 
 class V2EntryFilter:
-    def __init__(self, cfg: BotConfig, costs: CostModel, model: V2Model) -> None:
+    def __init__(self, cfg: BotConfig, costs: CostModel, model: "V2Model | TwoStageModel") -> None:
         self.cfg = cfg
         self.costs = costs
         self.model = model
@@ -146,6 +198,8 @@ class V2EntryFilter:
         if min(f.get("bid_depth_10bps", 0.0), f.get("ask_depth_10bps", 0.0)) < e.min_depth_usdt_within_10bps:
             return EntryDecision(False, "insufficient_depth")
 
+        if not probs:
+            return EntryDecision(False, getattr(self.model, "last_reject", "") or "no_model_output")
         S = self.model.stop_bps
         notional = min(self.cfg.sizing.position_notional_usdt, self.cfg.risk.max_position_notional_usdt)
         best: V2Choice | None = None
@@ -200,7 +254,7 @@ class SignalEngineV2(SignalEngine):
     """Same pipeline/recording as V1's SignalEngine, with the V2 model and gate."""
 
     def __init__(self, cfg: BotConfig, costs: CostModel, recorder, risk, model_dir: str) -> None:
-        self.model = V2Model(model_dir)
+        self.model = load_v2_model(model_dir)
         super().__init__(cfg, None, None, recorder, risk)   # predictor/filter replaced below
         self.v2_filter = V2EntryFilter(cfg, costs, self.model)
         self.histories: dict[str, FeatureHistory] = {}
