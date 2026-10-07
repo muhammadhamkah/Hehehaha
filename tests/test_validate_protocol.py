@@ -49,3 +49,17 @@ def test_validation_protocol_end_to_end_and_test_lock(tmp_path):
     for section in ("Verdict", "Opportunity decisions", "Feature analysis", "calibration", "Minimum tradable edge",
                     "Per-symbol", "Parameter sweep", "TEST"):
         assert section in md
+
+
+def test_ineffective_params_and_insufficient_test_verdict():
+    from research.validate import PRIMARY_LATENCY, ineffective_params, verdict
+
+    m1 = {"trades": 40, "expectancy": 0.2}
+    m2 = {"trades": 35, "expectancy": -0.1}
+    sweep = [
+        {"params": {"a": 1, "b": 1}, "train": m1}, {"params": {"a": 2, "b": 1}, "train": m1},
+        {"params": {"a": 1, "b": 2}, "train": m2}, {"params": {"a": 2, "b": 2}, "train": m2},
+    ]
+    assert ineffective_params(sweep) == ["a"]
+    rep = {"chosen": {"validation": {}}, "test": {PRIMARY_LATENCY: {"trades": 5, "expectancy": 0.3, "t_stat": 1.6}}}
+    assert verdict(rep, 30).startswith("INSUFFICIENT TEST SAMPLE")

@@ -125,3 +125,19 @@ All of the following must hold:
 
 If these aren't met, the report says so plainly (for example, "NO EDGE ON UNSEEN DATA").
 Do **not** loosen thresholds to manufacture trades.
+
+## Appendix: sanity check of the research tooling (synthetic data)
+
+The protocol was run on two synthetic 45-minute, 2-symbol datasets: one with zero
+predictive power, one with a planted edge. This tests the **tooling**. It says nothing
+about real markets.
+
+| Dataset | Feature analysis | TRAIN expectancy | VALIDATION expectancy | Verdict |
+|---|---|---|---|---|
+| edge = 0 | no significant feature (best \|t\| ≈ 1.5) | −0.081 USDT/trade (t = −2.7) | no config qualified | **NO EDGE DEMONSTRATED** |
+| planted edge | book imbalance IC ≈ 0.60, t ≈ 17.8, stable | +0.18 USDT/trade (t = 3.2) | +0.51 USDT/trade (10 trades) | test had only 5 trades → **INSUFFICIENT TEST SAMPLE** |
+
+So the tooling reports no edge when there is none, detects a real one, and refuses to
+call an edge proven when the unseen sample is too small. The run also showed that
+`target_bps` at 6 or 12 had no effect: the cost-derived required move (~16 bps at
+150 USDT) always binds first. The report now flags such dimensions automatically.

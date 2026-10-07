@@ -199,6 +199,7 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
         sweep.append({"params": c, "train": m, "eligible": (m["trades"] or 0) >= min_trades})
     ranked = sorted(sweep, key=lambda s: (s["eligible"], s["train"]["expectancy"] or -1e9), reverse=True)
     report["sweep_train"] = ranked
+    report["ineffective_params"] = ineffective_params(sweep)
 
     # -- 4. VALIDATION on top-K eligible
     top = [s for s in ranked if s["eligible"]][:top_k]
@@ -258,6 +259,25 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
     return report
 
 
+def ineffective_params(sweep: list[dict[str, Any]]) -> list[str]:
+    """Parameters whose tested values never changed TRAIN results (holding the others fixed).
+
+    Typical cause: another constraint binds first (e.g. target_bps below the cost-derived
+    required move), so the grid wastes runs on that dimension.
+    """
+    out = []
+    keys = sorted({k for s in sweep for k in s["params"]})
+    for k in keys:
+        groups: dict[str, set] = {}
+        for s in sweep:
+            rest = json.dumps({kk: v for kk, v in s["params"].items() if kk != k}, sort_keys=True)
+            groups.setdefault(rest, set()).add(json.dumps(s["train"], sort_keys=True, default=str))
+        varied = len({json.dumps(s["params"].get(k)) for s in sweep}) > 1
+        if varied and all(len(g) == 1 for g in groups.values()):
+            out.append(k)
+    return out
+
+
 def verdict(report: dict[str, Any], min_trades: int) -> str:
     feats = report.get("baseline_train", {}).get("features", {}).get("verdict", "")
     chosen = report.get("chosen")
@@ -271,6 +291,10 @@ def verdict(report: dict[str, Any], min_trades: int) -> str:
                 f"{v['trades']} trades. Not evidence of an edge until evaluated once on TEST.")
     t = test[PRIMARY_LATENCY]
     slow = test.get(250, {})
+    if (t["trades"] or 0) < min_trades:
+        return (f"INSUFFICIENT TEST SAMPLE: {t['trades']} trades on the unseen period (minimum {min_trades}); "
+                f"expectancy {t['expectancy']} USDT/trade, t={t['t_stat']}. No conclusion either way — "
+                "record more data.")
     ok = ((t["trades"] or 0) >= min_trades and (t["expectancy"] or 0) > 0 and (t["t_stat"] or 0) > 2
           and (slow.get("expectancy") or 0) > 0)
     if ok:

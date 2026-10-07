@@ -78,6 +78,9 @@ def write_markdown(rep: dict[str, Any], path: str) -> None:
     w("## 8. Parameter sweep (TRAIN) — ranked by expectancy per trade after costs\n")
     sw = rep.get("sweep_train", [])
     w(f"{len(sw)} configurations; eligible = at least {rep.get('min_trades')} trades.\n")
+    if rep.get("ineffective_params"):
+        w(f"⚠️ Parameters with **no effect** in the tested range (another constraint binds first): "
+          f"`{rep['ineffective_params']}`\n")
     w(_table([{"params": s["params"], "eligible": s["eligible"], **s["train"]} for s in sw[:15]],
              ["params", "eligible"] + METRIC_COLS))
 
