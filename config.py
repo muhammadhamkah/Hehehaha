@@ -154,6 +154,9 @@ class EntryConfig:
     stop_bps: float = 8.0
     stop_vol_mult: float = 0.0            # >0: stop = max(stop_bps, mult * sigma_horizon)
     require_flow_confirmation: bool = True
+    # Directional thresholds for research sweeps; -1.0 disables them (default behaviour).
+    min_book_imbalance: float = -1.0      # direction * imb_weighted must be >= this
+    min_flow_imbalance: float = -1.0      # direction * flow_imb_3s must be >= this
     max_book_imbalance_abs: float = 0.97  # reject near-one-sided books (likely abnormal)
     min_trades_per_s: float = 1.0
     max_realized_vol_bps_1s: float = 15.0 # abnormal volatility guard

@@ -45,7 +45,7 @@ def compute_features(book: OrderBook, flow: TradeFlow, cfg: FeatureConfig, now_m
     f["micro_tilt"] = tilt
 
     # --- book dynamics
-    h = book.history
+    h = list(book.history)   # one snapshot; the helpers binary-search it
     f["ofi_1s"] = obf.order_flow_imbalance(h, now_ms, 1.0)
     f["ofi_3s"] = obf.order_flow_imbalance(h, now_ms, 3.0)
     f["ofi_10s"] = obf.order_flow_imbalance(h, now_ms, 10.0)

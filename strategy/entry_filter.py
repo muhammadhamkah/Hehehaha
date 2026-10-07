@@ -90,6 +90,10 @@ class EntryFilter:
             return EntryDecision(False, "low_confidence", details={"confidence": pred.confidence})
         if e.require_flow_confirmation and not pred.flow_confirms:
             return EntryDecision(False, "flow_not_confirming")
+        if direction * f.get("imb_weighted", 0.0) < e.min_book_imbalance:
+            return EntryDecision(False, "book_imbalance_below_min")
+        if direction * f.get("flow_imb_3s", 0.0) < e.min_flow_imbalance:
+            return EntryDecision(False, "flow_imbalance_below_min")
 
         bd10, ad10 = f.get("bid_depth_10bps", 0.0), f.get("ask_depth_10bps", 0.0)
         if min(bd10, ad10) < e.min_depth_usdt_within_10bps:

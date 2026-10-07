@@ -83,3 +83,17 @@ def test_horizon_gap_yields_null(tmp_path):
     # 1s: first quote 3s late -> NULL; 3s: quote 1s late (within tolerance) -> labelled;
     # 5s: next quote arrives at 61s -> NULL rather than a misleading stale value.
     assert row["ret_1s"] is None and row["ret_3s"] is not None and row["ret_5s"] is None
+
+
+def test_plan_target_labels_for_calibration(tmp_path):
+    cfg, db, rec = _setup(tmp_path)
+    # plan: long, 20bps target, 5bps stop (different from the fixed 6/8 label barrier)
+    sid = rec.record_signal("AAA", T0, _features(), _pred(1), "reject", "x", "signal",
+                            {"target_bps": 20.0, "stop_bps": 5.0, "p_target": 0.7})
+    for i in range(1, 62):        # +0.25bp/s (~15bps): 6bps fixed target hit, 20bps plan target not
+        mid = 100.005 * (1 + 0.25 * i / 1e4)
+        rec.on_quote("AAA", T0 + i * 1000, mid - 0.005, mid + 0.005)
+    db.flush()
+    row = db.query("SELECT tp_long, tp_plan FROM signals WHERE id = ?", (sid,))[0]
+    db.close()
+    assert row["tp_long"] == 1 and row["tp_plan"] == 0

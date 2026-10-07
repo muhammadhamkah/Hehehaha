@@ -125,6 +125,7 @@ class TradingBot:
         # Replay warm-up: market state is built from earlier events, but no trades are
         # opened and no signals recorded before this timestamp.
         self.active_from_ms = 0
+        self.active_until_ms = float("inf")   # replay segment end: no evaluations at/after it
 
     def _make_ws(self) -> None:
         cfg = self.cfg
@@ -376,7 +377,7 @@ class TradingBot:
                 if symbol in self.positions or symbol in self._entering:
                     continue
                 self.n_evals += 1
-                active = now >= self.active_from_ms
+                active = self.active_from_ms <= now < self.active_until_ms
                 res = self.signals.evaluate(symbol, book, flow, now, trading_enabled=self.trading and active,
                                             record=active)
                 if res.action == "enter" and not self._entering and \

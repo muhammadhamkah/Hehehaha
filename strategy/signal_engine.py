@@ -37,6 +37,8 @@ class SignalEngine:
         self.recorder = recorder
         self.risk = risk
         self.rejections: dict[str, int] = {}
+        # Every evaluation's outcome: "enter" / "would_enter" or the rejection reason.
+        self.decisions: dict[str, int] = {}
 
     def features(self, book: OrderBook, flow: TradeFlow, now_ms: int) -> dict[str, float]:
         f = compute_features(book, flow, self.cfg.features, now_ms)
@@ -63,6 +65,9 @@ class SignalEngine:
                 action = "enter" if trading_enabled else "would_enter"
         if not decision.ok:
             self.rejections[decision.reason] = self.rejections.get(decision.reason, 0) + 1
+        if record:   # not counted during replay warm-up
+            key = action if action != "reject" else decision.reason
+            self.decisions[key] = self.decisions.get(key, 0) + 1
 
         result = SignalResult(symbol, now_ms, f, pred, decision, action)
         if record and self.recorder is not None:
