@@ -7,12 +7,12 @@ plus executed aggressor flow. It does **not** use candle indicators.
 The system only enters when the **expected NET profit after fees and slippage is at least
 0.10 USDT**. It would rather skip a trade than take a marginal one.
 
-> ⚠️ **Status:** Phases 1–7 are implemented and unit-tested, and the paper simulator has been
-> run end-to-end on a synthetic feed. The code has **not** been run against the real Binance
-> endpoints yet, because the build sandbox has no network access to Binance. Run it in
-> `record` mode first, check the data, and expect to adjust things. The rule-based weights
-> are **uncalibrated placeholders** until you have run the Phase 5 analysis on your own
-> recorded data.
+> ⚠️ **Status:** Phases 1–7 are implemented, along with an event-driven tick replay
+> backtester and a train/validation/test research protocol. All of it is tested offline:
+> against mock Binance servers and synthetic data. **None of it has run against real
+> Binance data yet**, because the build sandbox cannot reach Binance. Follow
+> [`docs/VALIDATION_RUNBOOK.md`](docs/VALIDATION_RUNBOOK.md) on a machine that can. Live
+> trading stays disabled. The rule-based weights are **uncalibrated placeholders**.
 
 ## Decision pipeline
 
@@ -47,6 +47,38 @@ still satisfying the probability constraint. Exits are always costed as **taker*
 the worst case. A maker entry is charged an adverse-selection allowance rather than credited
 with half the spread.
 
+## Replay backtester and validation
+
+Recorded Binance events are replayed through the **same** `TradingBot`: the same order
+book, trade flow, features, predictor, entry filter, risk manager, exit engine, and
+paper execution simulator. There is no separate backtest strategy.
+
+```
+recorded events → chronological queue (EventReader, exchange or local timestamps)
+  → virtual-time asyncio loop (max-speed deterministic, 1×, or N×)
+  → bot WebSocket handlers (only streams the bot was subscribed to at that moment)
+  → signal engine → PaperExchange (latency, queue position, partial fills, TTL, fees)
+  → exits → trade log → performance / decisions / calibration / features / min-edge reports
+```
+
+* **No look-ahead.** A test changes every event after time T and asserts that every
+  signal, order, and entry before T is identical. Messages that arrived abnormally late
+  are replayed at their receive time.
+* **Deterministic.** The same input always produces the same trades.
+* **Latency is configurable.** Order acknowledgement lags submission by exactly the
+  configured latency (tested at 20 and 250 ms); the protocol re-runs at 20/50/100/250/500 ms.
+* **Research protocol (`research.validate`).** Chronological 60/20/20 split. Sweep on
+  TRAIN, select on VALIDATION, then evaluate **once** on TEST (enforced by
+  `test_lock.json`). The primary metric is expected net PnL per trade after all costs.
+
+```bash
+python -m tools.validate_binance                     # live connectivity + parser validation (read-only)
+python main.py --mode record                         # records raw events to data/events/
+python -m backtest.replay --events data/events --out runs/r1 --latency-ms 100
+python -m research.validate --events data/events --out runs/v1 --workers 4   # TEST untouched
+python -m research.validate --events data/events --out runs/v1 --final-test  # once, frozen config
+```
+
 ## Project layout
 
 ```
@@ -54,8 +86,9 @@ config.py                  all tunables (dataclasses), JSON/env overrides, live-
 main.py                    orchestrator (asyncio): WS → books → signals → execution → logs
 exchange/
   binance_client.py        async REST (signed endpoints, weight/backoff handling, -1021 resync)
-  websocket_manager.py     combined streams, dynamic SUBSCRIBE, reconnect/backoff, 24h recycle,
-                           user-data stream (listenKey keepalive)
+  websocket_manager.py     combined streams, dynamic SUBSCRIBE (ack/error tracking), reconnect/backoff,
+                           silence watchdog, stream cap, 24h recycle, user-data stream
+  schemas.py               strict payload validation + feed health (id gaps, pu continuity, latency)
   execution.py             PaperExchange (simulator), LiveExchange, TradeExecutor (entry/exit protocol)
   models.py                Order / Fill / SymbolInfo (tick/step rounding)
 market_data/
@@ -77,14 +110,27 @@ strategy/
 risk/risk_manager.py       daily loss, consecutive losses, trades/hour, cooldowns, limits, kill switch
 data/
   database.py              SQLite (WAL) with background writer thread
+  event_store.py           raw event writer/reader for replay (gzip JSONL, exchange-time ordering)
   recorder.py              signal recorder + forward labeller (1/3/5/10/30/60 s, TP-before-SL, MFE/MAE)
 analytics/
   trade_logger.py          per-trade record (SQLite + JSONL)
   performance.py           stats + "profitable after costs?" verdict (CLI)
+backtest/
+  virtual_loop.py          virtual-time asyncio event loop (deterministic simulated clock)
+  replay.py                event-driven replay through the real TradingBot (CLI)
+  synthetic.py             Binance-shaped synthetic events (pipeline tests ONLY)
+  report.py                replay summary formatting
+tools/
+  validate_binance.py      read-only live connectivity / parser validation
+  binance_archive.py       data.binance.vision aggTrades + bookTicker → replayable events (L1)
 research/
+  validate.py              train/validation/test protocol, sweep, latency robustness, test lock
+  analysis.py              per-symbol, calibration, feature IC analysis, minimum tradable edge
+  report.py                VALIDATION_REPORT.md writer
   analyze_signals.py       Phase 5: edge by signal bucket, in-sample vs out-of-sample, IC, calibration
   train_model.py           logistic model → models/linear_model.json (plug into predictor)
-tests/                     72 tests (unit + offline end-to-end)
+docs/VALIDATION_RUNBOOK.md step-by-step validation on real data
+tests/                     unit, mock-Binance, replay determinism / look-ahead / latency tests
 ```
 
 ## Install
@@ -223,15 +269,17 @@ execution has to change.
 
 ## Known limitations / next steps
 
-* **Not yet verified against live Binance.** Check the stream payloads, the depth-stream
-  choice, and the testnet behaviour before trusting it.
+* **Not yet verified against live Binance.** Run `tools.validate_binance` first.
 * **WebSocket URL changes:** Binance has been reorganising its futures WebSocket URLs. If the
   connection fails, update `exchange.ws_base` in your config.
 * **Uncalibrated defaults:** `logistic_k`, `drift_per_score`, and the component weights are
   heuristic defaults. Calibrate them with Phase 5 data.
-* **No tick-level replay backtester yet:** the paper simulator runs in real time. The
-  `signals` table is enough to measure the edge offline. To add full tick replay, record raw
-  books (`recorder.record_raw_book=true`) and use `ManualClock`.
+* **Replay speed:** pure Python, roughly 15–20× real time per 3 symbols on synthetic data.
+  Real BTC-class feeds are busier, so sweeps over many symbol-days need several workers
+  and time.
+* **Simulation limits:** the maker queue is approximated from visible size and trade
+  prints. Hidden liquidity, queue jumping, and exchange-side latency variance are not
+  modelled.
 * **Geo-restrictions:** Binance futures is not available in every jurisdiction. Make sure you
   are allowed to use it.
 
