@@ -19,3 +19,4 @@ data/v2/
 v2_dataset.log
 models/v2/
 runs_v1_resume.sh
+runs_v2_models.sh
