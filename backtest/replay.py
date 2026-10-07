@@ -24,6 +24,14 @@ CLI:
 """
 from __future__ import annotations
 
+import os as _os
+
+# Pin BLAS/OpenMP to one thread BEFORE numpy loads: the barrier model uses tiny matrices,
+# and parallel replay workers each spawning a BLAS thread pool oversubscribed the CPU
+# (observed: replay slowed to below real time).
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    _os.environ.setdefault(_var, "1")
+
 import argparse
 import asyncio
 import copy

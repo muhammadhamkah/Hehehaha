@@ -21,6 +21,14 @@ no configuration shows positive validation expectancy, that is the reported resu
 """
 from __future__ import annotations
 
+import os as _os
+
+# Pin BLAS/OpenMP to one thread BEFORE numpy loads: the barrier model uses tiny matrices,
+# and parallel replay workers each spawning a BLAS thread pool oversubscribed the CPU
+# (observed: replay slowed to below real time).
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    _os.environ.setdefault(_var, "1")
+
 import argparse
 import copy
 import hashlib
@@ -203,9 +211,25 @@ class Runner:
     """Expands segment runs into day shards, executes all shards in one process pool."""
 
     def __init__(self, events: str, out: str, bounds: dict[str, tuple[int, int]], symbols: list[str],
-                 warmup_ms: int, workers: int) -> None:
+                 warmup_ms: int, workers: int, daily_window: tuple[int, int] | None = None) -> None:
         self.events, self.out, self.bounds = events, out, bounds
         self.symbols, self.warmup_ms, self.workers = symbols, warmup_ms, workers
+        self.daily_window = daily_window       # (start_hour, end_hour) UTC, or None = whole day
+
+    def shards(self, s: int, e: int) -> list[tuple[int, int, int]]:
+        """(warmup_from, trade_start, end) per shard."""
+        out = []
+        for a, b in day_shards(s, e):
+            if self.daily_window:
+                day = a // DAY_MS * DAY_MS
+                a = max(a, day + self.daily_window[0] * 3_600_000)
+                b = min(b, day + self.daily_window[1] * 3_600_000)
+                start = a
+            else:
+                start = a + self.warmup_ms if a % DAY_MS == 0 else a   # warm up on same-day data
+            if start < b:
+                out.append((a, start, b))
+        return out
 
     def run(self, requests: list[tuple[BotConfig, str, str, str, dict]]) -> list[dict[str, Any]]:
         """requests: (cfg, segment, sub_dir, label, extra ReplaySpec kwargs)."""
@@ -213,10 +237,7 @@ class Runner:
         for cfg, seg, sub, label, extra in requests:
             s, e = self.bounds[seg]
             idx = []
-            for a, b in day_shards(s, e):
-                start = a + self.warmup_ms if a % DAY_MS == 0 else a   # warm up on same-day data
-                if start >= b:
-                    continue
+            for a, start, b in self.shards(s, e):
                 d = os.path.join(self.out, seg, sub, datetime.fromtimestamp(a / 1000, tz=timezone.utc)
                                  .strftime("%Y%m%d_%H%M"))
                 spec = {"events_dir": self.events, "out_dir": d, "start_ms": start, "end_ms": b,
@@ -250,7 +271,8 @@ def load_many(dirs: list[str]):
 def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_combos: int | None,
              workers: int, symbols: list[str], fractions=(0.6, 0.2, 0.2), top_k: int = 5,
              min_trades: int = 30, final_test: bool = False, force_retest: bool = False,
-             latencies: list[int] = LATENCIES, warmup_ms: int = 120_000) -> dict[str, Any]:
+             latencies: list[int] = LATENCIES, warmup_ms: int = 120_000,
+             daily_window: tuple[int, int] | None = None) -> dict[str, Any]:
     import pandas as pd
 
     from research import analysis as A
@@ -267,10 +289,11 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
                   "validation": (snap(bounds["validation"][0]), snap(bounds["validation"][1])),
                   "test": (snap(bounds["test"][0]), t1)}
     report: dict[str, Any] = {"events": events, "bounds": bounds, "symbols": symbols,
-                              "grid": grid, "min_trades": min_trades, "created": time.time()}
+                              "grid": grid, "min_trades": min_trades, "created": time.time(),
+                              "daily_window_utc": daily_window}
     base = copy.deepcopy(cfg)
     base.execution.sim_latency_ms = PRIMARY_LATENCY
-    R = Runner(events, out, bounds, symbols, warmup_ms, workers)
+    R = Runner(events, out, bounds, symbols, warmup_ms, workers, daily_window)
 
     # -- 2. baseline (research recording) + 3. sweep, all on TRAIN, in one pool
     cands = combos(grid, max_combos) if grid else []     # empty grid: research-only run
@@ -314,9 +337,13 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
     report["chosen"] = chosen
     if chosen is not None:
         ccfg = apply(base, chosen["params"])
+        extra = [lat for lat in latencies if lat != PRIMARY_LATENCY]   # primary already run above
         lres = R.run([(apply(ccfg, {"latency_ms": lat}), "validation", f"latency_{lat}", f"lat{lat}", {})
-                      for lat in latencies])
-        report["validation_latency"] = {lat: metrics(r) for lat, r in zip(latencies, lres)}
+                      for lat in extra]) if extra else []
+        report["validation_latency"] = {lat: metrics(r) for lat, r in zip(extra, lres)}
+        if PRIMARY_LATENCY in latencies:
+            report["validation_latency"][PRIMARY_LATENCY] = chosen["validation"]
+        report["validation_latency"] = dict(sorted(report["validation_latency"].items()))
         report["chosen_config_hash"] = config_hash(ccfg)
         with open(os.path.join(out, "chosen_config.json"), "w", encoding="utf-8") as fh:
             json.dump(asdict(ccfg) | {"exchange": {}}, fh, indent=1, default=str)
@@ -422,6 +449,8 @@ def main() -> None:
     ap.add_argument("--latencies", nargs="*", type=int, default=LATENCIES)
     ap.add_argument("--research-only", action="store_true",
                     help="baseline analyses on TRAIN only (features, calibration, min edge); no sweep/test")
+    ap.add_argument("--daily-window", nargs=2, type=int, metavar=("START_H", "END_H"),
+                    help="replay only this UTC hour window of each day (compute-limited studies)")
     ap.add_argument("--final-test", action="store_true")
     ap.add_argument("--force-retest", action="store_true")
     args = ap.parse_args()
@@ -437,7 +466,7 @@ def main() -> None:
             grid = json.load(fh)
     rep = validate(cfg, args.events, args.out, grid, args.max_combos, args.workers, args.symbols,
                    tuple(args.split), args.top_k, args.min_trades, args.final_test, args.force_retest,
-                   args.latencies)
+                   args.latencies, daily_window=tuple(args.daily_window) if args.daily_window else None)
     print(f"\nVERDICT: {rep['verdict']}\nreport: {os.path.join(args.out, 'VALIDATION_REPORT.md')}")
 
 

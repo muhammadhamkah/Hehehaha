@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+from array import array
 from dataclasses import dataclass
 from typing import Any
 
@@ -107,15 +108,19 @@ def _first_touch(hit_tp: np.ndarray, hit_sl: np.ndarray) -> int:
 
 
 class _QuotePath:
-    """Per-symbol quote history since the oldest pending label (absolute indexing)."""
+    """Per-symbol quote history since the oldest pending label (absolute indexing).
+
+    Typed buffers (array.array) so a label's window is a zero-copy numpy view instead of
+    a list -> ndarray conversion of ~10k quotes on busy symbols.
+    """
 
     __slots__ = ("base", "ts", "bid", "ask")
 
     def __init__(self) -> None:
         self.base = 0
-        self.ts: list[int] = []
-        self.bid: list[float] = []
-        self.ask: list[float] = []
+        self.ts = array("q")
+        self.bid = array("d")
+        self.ask = array("d")
 
     @property
     def end(self) -> int:
@@ -123,13 +128,18 @@ class _QuotePath:
 
     def arrays(self, start_abs: int, end_abs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         i, j = start_abs - self.base, end_abs - self.base
-        return (np.asarray(self.ts[i:j], dtype=np.int64), np.asarray(self.bid[i:j]),
-                np.asarray(self.ask[i:j]))
+        # Copies are cheap (contiguous memcpy) and avoid holding buffer exports that would
+        # block later in-place pruning of the arrays.
+        return (np.frombuffer(self.ts, dtype=np.int64)[i:j].copy(),
+                np.frombuffer(self.bid, dtype=np.float64)[i:j].copy(),
+                np.frombuffer(self.ask, dtype=np.float64)[i:j].copy())
 
     def prune(self, keep_from_abs: int) -> None:
         k = keep_from_abs - self.base
         if k > 4096 and k > len(self.ts) // 2:
-            del self.ts[:k], self.bid[:k], self.ask[:k]
+            del self.ts[:k]
+            del self.bid[:k]
+            del self.ask[:k]
             self.base = keep_from_abs
 
 

@@ -5,6 +5,7 @@ scan over every trade in the window. This matters for replay speed.
 """
 from __future__ import annotations
 
+from array import array
 from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass
@@ -59,7 +60,7 @@ class TradeFlow:
         self._base = 0
         self._ts: list[int] = []
         self._px: list[float] = []
-        self._notional: list[float] = []
+        self._notional = array("d")   # typed buffer: numpy views for medians
         self._qty: list[float] = []
         self._sell: list[bool] = []
         self._cb: list[float] = []   # cumulative aggressive-buy notional

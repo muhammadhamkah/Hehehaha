@@ -29,6 +29,9 @@ def write_markdown(rep: dict[str, Any], path: str) -> None:
     w(f"Dataset: `{src}`  ·  symbols: {', '.join(rep.get('symbols') or []) or 'scanner-selected'}\n")
     for seg, (s, e) in rep["bounds"].items():
         w(f"- **{seg.upper()}**: {_iso(s)} → {_iso(e)} ({(e - s) / 3.6e6:.2f} h)")
+    if rep.get("daily_window_utc"):
+        h0, h1 = rep["daily_window_utc"]
+        w(f"- Replayed window: **{h0:02d}:00–{h1:02d}:00 UTC each day only** (results are conditional on it)")
     w("")
     w(f"## Verdict\n\n> **{rep['verdict']}**\n")
     t = rep.get("test", {})

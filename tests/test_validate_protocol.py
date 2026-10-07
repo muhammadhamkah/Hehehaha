@@ -72,3 +72,15 @@ def test_day_shards_split_at_utc_midnight():
     assert day_shards(d + 5, d + 2 * DAY_MS + 7) == [(d + 5, d + DAY_MS), (d + DAY_MS, d + 2 * DAY_MS),
                                                       (d + 2 * DAY_MS, d + 2 * DAY_MS + 7)]
     assert day_shards(d, d + 100) == [(d, d + 100)]
+
+
+def test_daily_window_shards():
+    from research.validate import DAY_MS, Runner
+
+    d = 1711324800000
+    r = Runner("x", "o", {}, [], 120_000, 1, daily_window=(13, 17))
+    assert r.shards(d, d + 2 * DAY_MS) == [(d + 13 * 3_600_000, d + 13 * 3_600_000, d + 17 * 3_600_000),
+                                           (d + DAY_MS + 13 * 3_600_000, d + DAY_MS + 13 * 3_600_000,
+                                            d + DAY_MS + 17 * 3_600_000)]
+    r2 = Runner("x", "o", {}, [], 120_000, 1)
+    assert r2.shards(d, d + DAY_MS)[0] == (d, d + 120_000, d + DAY_MS)
