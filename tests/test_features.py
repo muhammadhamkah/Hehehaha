@@ -52,3 +52,33 @@ def test_duplicate_trade_ids_ignored():
     flow.add(Trade(1, 1.0, 1.0, False), 1, trade_id=5)
     flow.add(Trade(2, 1.0, 1.0, False), 2, trade_id=5)
     assert len(flow.trades) == 1
+
+
+def test_prefix_sum_windows_match_naive_after_pruning():
+    import random
+
+    from market_data.tradeflow import Trade
+
+    rng = random.Random(7)
+    flow = TradeFlow("X", history_s=10.0)
+    raw = []
+    t = 0
+    for _ in range(20_000):           # many prunes (history 10s, ~2ms spacing)
+        t += rng.randint(0, 4)
+        tr = Trade(t, 100 + rng.random(), rng.random() * 3, rng.random() < 0.4)
+        flow.add(tr, t)
+        raw.append(tr)
+        if rng.random() < 0.01:
+            for win in (0.5, 1.0, 3.0, 9.0):
+                now = t - rng.randint(0, 50)
+                lo = now - int(win * 1000)
+                sel = [x for x in raw if lo < x.ts_ms <= now and x.ts_ms >= t - 10_000]
+                w = flow.window(now, win)
+                if lo < t - 10_000:   # window reaches beyond retained history; skip
+                    continue
+                assert w.count == len(sel)
+                assert abs(w.buy_notional - sum(x.notional for x in sel if not x.is_buyer_maker)) < 1e-6
+                assert abs(w.sell_notional - sum(x.notional for x in sel if x.is_buyer_maker)) < 1e-6
+                if sel:
+                    assert w.first_price == sel[0].price and w.last_price == sel[-1].price
+    assert flow._base > 0   # pruning actually happened

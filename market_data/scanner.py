@@ -202,6 +202,9 @@ class MarketScanner:
     def select(self, now_ms: int) -> list[str]:
         """Update and return the shortlist (top_n with hysteresis) plus pinned symbols."""
         ranked = self.rank(now_ms)
+        if self.cfg.static_symbols:
+            self.selected = [s for s in self.cfg.static_symbols if not self.eligible or s in self.eligible]
+            return self.active_symbols()
         order = [r.symbol for r in ranked]
         pos = {s: i for i, s in enumerate(order)}
         n = self.cfg.top_n

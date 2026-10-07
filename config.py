@@ -38,6 +38,10 @@ class ExchangeConfig:
     ws_reconnect_max_backoff_s: float = 30.0
     # Binance drops connections at 24h; reconnect proactively before that.
     ws_max_connection_age_s: float = 23 * 3600
+    # Binance allows up to 1024 streams per futures connection; stay well below.
+    ws_max_streams_per_connection: int = 200
+    # Reconnect if a subscribed connection delivers no data for this long.
+    ws_silence_timeout_s: float = 10.0
 
     @property
     def rest_url(self) -> str:
@@ -61,6 +65,9 @@ class ScannerConfig:
     activity_window_s: float = 60.0
     min_age_for_ranking_s: float = 10.0
     exclude_symbols: tuple[str, ...] = ()
+    # If set, always analyse exactly these symbols (ranking still computed for logging).
+    # Used for fixed-universe recording and for replaying archive data without tickers.
+    static_symbols: tuple[str, ...] = ()
     # Ranking weights (applied to cross-sectional percentile ranks).
     w_volume: float = 1.0
     w_spread: float = 1.5
@@ -74,6 +81,7 @@ class ScannerConfig:
 class MarketDataConfig:
     # "partial" -> <sym>@depth20@100ms snapshots (robust, no sync needed)
     # "diff"    -> <sym>@depth@100ms diffs + REST snapshot (full local book)
+    # "bbo"     -> top of book only from bookTicker (L1 data, e.g. public archives)
     depth_mode: str = "partial"
     depth_levels: int = 20
     diff_snapshot_limit: int = 1000
@@ -221,6 +229,9 @@ class RecorderConfig:
     label_stop_bps: float = 8.0
     flush_interval_s: float = 1.0
     trades_jsonl: str = "data/trades.jsonl"
+    # Raw WebSocket event capture for exact replay (~3-6 GB/day gzipped at 30 symbols).
+    record_events: bool = True
+    events_dir: str = "data/events"
 
 
 @dataclass
@@ -272,8 +283,8 @@ class BotConfig:
             problems.append("execution.ttl_fallback must be 'skip' or 'taker_if_edge'")
         if self.execution.entry_mode not in ("maker_first", "taker"):
             problems.append("execution.entry_mode must be 'maker_first' or 'taker'")
-        if self.market_data.depth_mode not in ("partial", "diff"):
-            problems.append("market_data.depth_mode must be 'partial' or 'diff'")
+        if self.market_data.depth_mode not in ("partial", "diff", "bbo"):
+            problems.append("market_data.depth_mode must be 'partial', 'diff' or 'bbo'")
         if self.entry.min_net_profit_usdt <= 0:
             problems.append("entry.min_net_profit_usdt must be positive")
         if self.mode == "live" and not self.dry_run and not self.live_trading_enabled():
