@@ -406,6 +406,24 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
     return report
 
 
+def refresh_report(out: str, min_trades: int | None = None) -> str:
+    """Re-derive the verdict and markdown from a stored report (no replays, test not re-run)."""
+    path = os.path.join(out, "validation_report.json")
+    with open(path, encoding="utf-8") as fh:
+        rep = json.load(fh)
+    if isinstance(rep.get("test"), dict):
+        rep["test"] = {int(k) if str(k).isdigit() else k: v for k, v in rep["test"].items()}
+    if isinstance(rep.get("validation_latency"), dict):
+        rep["validation_latency"] = {int(k): v for k, v in rep["validation_latency"].items()}
+    rep["verdict"] = verdict(rep, min_trades or rep.get("min_trades", 30))
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(rep, fh, indent=1, default=str)
+    from research.report import write_markdown
+
+    write_markdown(rep, os.path.join(out, "VALIDATION_REPORT.md"))
+    return rep["verdict"]
+
+
 def ineffective_params(sweep: list[dict[str, Any]]) -> list[str]:
     """Parameters whose tested values never changed TRAIN results (holding the others fixed).
 
@@ -442,6 +460,10 @@ def verdict(report: dict[str, Any], min_trades: int) -> str:
                 f"{v['trades']} trades. Not evidence of an edge until evaluated once on TEST.")
     t = test[PRIMARY_LATENCY]
     slow = test.get(250, {})
+    if (t["trades"] or 0) >= 5 and (t["t_stat"] or 0) <= -2 and (t["expectancy"] or 0) < 0:
+        # The trade minimum guards POSITIVE claims; a significantly losing result is conclusive.
+        return (f"NO EDGE — SIGNIFICANTLY NEGATIVE ON UNSEEN DATA: expectancy {t['expectancy']} USDT/trade over "
+                f"{t['trades']} test trades (t={t['t_stat']}); 250 ms latency expectancy {slow.get('expectancy')}.")
     if (t["trades"] or 0) < min_trades:
         return (f"INSUFFICIENT TEST SAMPLE: {t['trades']} trades on the unseen period (minimum {min_trades}); "
                 f"expectancy {t['expectancy']} USDT/trade, t={t['t_stat']}. No conclusion either way — "

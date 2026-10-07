@@ -103,3 +103,13 @@ def test_resume_reuses_only_identical_shards(tmp_path):
     changed = BotConfig()
     changed.entry.stop_bps = 99
     assert Runner._reusable((changed, spec, "L")) is None
+
+
+def test_significantly_negative_small_sample_is_conclusive():
+    from research.validate import PRIMARY_LATENCY, verdict
+
+    rep = {"chosen": {"validation": {}},
+           "test": {PRIMARY_LATENCY: {"trades": 10, "expectancy": -0.14, "t_stat": -9.3}, 250: {"expectancy": -0.15}}}
+    assert verdict(rep, 30).startswith("NO EDGE — SIGNIFICANTLY NEGATIVE")
+    rep["test"][PRIMARY_LATENCY] = {"trades": 10, "expectancy": 0.2, "t_stat": 3.0}
+    assert verdict(rep, 30).startswith("INSUFFICIENT TEST SAMPLE")     # positive claims still need 30
