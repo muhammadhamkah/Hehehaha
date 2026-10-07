@@ -1,0 +1,6 @@
+{
+  "mode": "record",
+  "scanner": {"top_n": 30},
+  "strategy": {"record_score_threshold": 0.1, "baseline_sample_prob": 0.02},
+  "recorder": {"record_raw_book": false}
+}

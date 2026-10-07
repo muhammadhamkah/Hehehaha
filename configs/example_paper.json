@@ -1,0 +1,11 @@
+{
+  "mode": "paper",
+  "dry_run": true,
+  "scanner": {"top_n": 20, "min_quote_volume_24h": 50000000},
+  "sizing": {"account_equity_usdt": 100, "position_notional_usdt": 150, "leverage": 5,
+             "max_risk_per_trade_usdt": 1.0, "max_simultaneous_positions": 1},
+  "entry": {"min_net_profit_usdt": 0.10, "min_confidence": 0.62, "min_p_target_before_stop": 0.55,
+            "max_spread_bps": 3.0},
+  "execution": {"entry_mode": "maker_first", "maker_ttl_ms": 1500, "ttl_fallback": "taker_if_edge"},
+  "risk": {"daily_loss_limit_usdt": 3.0, "max_consecutive_losses": 5, "max_trades_per_hour": 30}
+}
