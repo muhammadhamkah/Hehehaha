@@ -54,3 +54,13 @@ def test_exchange_time_extraction():
     assert exchange_time("x", {"T": 4}, 9) == 4
     assert exchange_time("x", {"bids": []}, 9) == 9
     assert exchange_time("x", [{"E": 3}, {"E": 7}], 9) == 7
+
+
+def test_blocking_writer_never_drops(tmp_path):
+    w = EventWriter(str(tmp_path), blocking=True)
+    w._q.maxsize = 100          # tiny queue: a non-blocking writer would drop most of these
+    for i in range(20_000):
+        w.write("detail", "a@aggTrade", {"E": 1_700_000_000_000 + i}, 1_700_000_000_000 + i)
+    w.close()
+    assert w.dropped == 0 and w.n_written == 20_000
+    assert sum(1 for _ in EventReader(str(tmp_path))) == 20_000

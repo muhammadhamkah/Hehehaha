@@ -148,7 +148,7 @@ def main() -> None:
         d0 = date.fromisoformat(args.start)
         days = [(d0 + timedelta(days=i)).isoformat() for i in range(args.days)]
     src = args.input_dir or args.download_dir
-    writer = EventWriter(args.out)
+    writer = EventWriter(args.out, blocking=True)
     meta: dict = {"source": "binance_public_archive_L1", "depth_mode": "bbo", "symbol_info": {}, "missing": []}
     for sym in args.symbols:
         aggs, bts = [], []
@@ -173,8 +173,12 @@ def main() -> None:
             continue
         res = convert(sym, aggs, bts, writer)
         meta["symbol_info"][sym] = res["symbol_info"]
+        meta.setdefault("counts", {})[sym] = sum(res["counts"].values())
         log.info("%s converted: %s", sym, res["counts"])
     writer.close()
+    if writer.dropped or writer.n_written != sum(meta.get("counts", {}).values()):
+        raise SystemExit(f"conversion incomplete: wrote {writer.n_written}, expected "
+                         f"{sum(meta.get('counts', {}).values())}, dropped {writer.dropped}")
     writer.write_meta(meta)
     if meta["missing"]:
         log.warning("missing archive files: %s", meta["missing"])

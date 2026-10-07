@@ -58,8 +58,11 @@ class ReplayEvent:
 
 
 class EventWriter:
-    def __init__(self, root: str, meta: dict | None = None) -> None:
+    def __init__(self, root: str, meta: dict | None = None, blocking: bool = False) -> None:
+        """blocking=False (live): never stall the event loop; drops are counted and logged.
+        blocking=True (offline conversion): back-pressure instead of dropping."""
         self.root = root
+        self.blocking = blocking
         os.makedirs(root, exist_ok=True)
         if meta is not None:
             self.write_meta(meta)
@@ -80,6 +83,9 @@ class EventWriter:
             json.dump(existing, fh, indent=1)
 
     def write(self, conn: str, stream: str, data: Any, local_ts: int) -> None:
+        if self.blocking:
+            self._q.put((local_ts, conn, stream, data))
+            return
         try:
             self._q.put_nowait((local_ts, conn, stream, data))
         except queue.Full:
@@ -111,6 +117,10 @@ class EventWriter:
             self.n_written += 1
         if fh is not None:
             fh.close()
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
 
     def close(self) -> None:
         self._q.put(None)
