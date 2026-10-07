@@ -207,7 +207,8 @@ def bucket_table(se: pd.DataFrame, score: np.ndarray, p_up: np.ndarray, X: int, 
         nl = realised_bps(se, "long", X, S, se[f"cost_bps_long_{notional}"].to_numpy(float))
         ns = realised_bps(se, "short", X, S, se[f"cost_bps_short_{notional}"].to_numpy(float))
         tpl, tps = tp_first(se, "long", X, S), tp_first(se, "short", X, S)
-        nets[S] = (np.where(side_long, nl, ns), np.where(side_long, tpl, tps), np.where(upl, nl, ns))
+        fin = lambda v: np.where(np.isfinite(v), v, np.nan)        # untradeable rows (no cost) are excluded
+        nets[S] = (fin(np.where(side_long, nl, ns)), np.where(side_long, tpl, tps), fin(np.where(upl, nl, ns)))
     rows = []
     for f in TOP[:5]:
         m = score >= np.quantile(score, 1 - f)
