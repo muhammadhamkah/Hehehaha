@@ -63,3 +63,12 @@ def test_ineffective_params_and_insufficient_test_verdict():
     assert ineffective_params(sweep) == ["a"]
     rep = {"chosen": {"validation": {}}, "test": {PRIMARY_LATENCY: {"trades": 5, "expectancy": 0.3, "t_stat": 1.6}}}
     assert verdict(rep, 30).startswith("INSUFFICIENT TEST SAMPLE")
+
+
+def test_day_shards_split_at_utc_midnight():
+    from research.validate import DAY_MS, day_shards
+
+    d = 1711324800000          # 2024-03-25T00:00Z
+    assert day_shards(d + 5, d + 2 * DAY_MS + 7) == [(d + 5, d + DAY_MS), (d + DAY_MS, d + 2 * DAY_MS),
+                                                      (d + 2 * DAY_MS, d + 2 * DAY_MS + 7)]
+    assert day_shards(d, d + 100) == [(d, d + 100)]

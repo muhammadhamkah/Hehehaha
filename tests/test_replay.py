@@ -108,3 +108,13 @@ def test_segment_end_is_respected(dataset, tmp_path):
     rows = _rows(str(tmp_path / "seg" / "replay.sqlite"), "SELECT MAX(ts_ms) AS m, MIN(ts_ms) AS n FROM signals")
     assert rows[0]["m"] < end and rows[0]["n"] >= info["start_ms"] + 60_000
     assert res["replay"]["last_ts"] < end
+
+
+def test_fast_clock_path_gives_identical_results(dataset, tmp_path):
+    d, _ = dataset
+    run_replay(_cfg(), ReplaySpec(d, str(tmp_path / "slow"), fast_clock=False))
+    run_replay(_cfg(), ReplaySpec(d, str(tmp_path / "fast"), fast_clock=True))
+    for q in ("SELECT ts_ms, symbol, features_json, decision, rejection_reason FROM signals ORDER BY id",
+              "SELECT ts_ms, event, status, filled_qty, avg_price FROM orders ORDER BY id",
+              "SELECT symbol, entry_ts_ms, exit_ts_ms, net_pnl FROM trades ORDER BY id"):
+        assert _rows(str(tmp_path / "slow" / "replay.sqlite"), q) == _rows(str(tmp_path / "fast" / "replay.sqlite"), q)

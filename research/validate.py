@@ -32,11 +32,12 @@ import random
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any
 
 from backtest.replay import ReplaySpec, run_replay
 from config import BotConfig, _merge, load_config
-from data.event_store import EventReader
+from data.event_store import open_reader
 
 log = logging.getLogger("validate")
 
@@ -134,6 +135,9 @@ def metrics(res: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+DAY_MS = 86_400_000
+
+
 def _run(args: tuple) -> dict[str, Any]:
     cfg, spec_kwargs, label = args
     logging.getLogger().setLevel(logging.ERROR)
@@ -151,48 +155,143 @@ def run_many(jobs: list[tuple], workers: int) -> list[dict[str, Any]]:
         return list(ex.map(_run, jobs))
 
 
+def day_shards(start: int, end: int) -> list[tuple[int, int]]:
+    """Split [start, end) at UTC midnights."""
+    out, cur = [], start
+    while cur < end:
+        nxt = min(end, (cur // DAY_MS + 1) * DAY_MS)
+        out.append((cur, nxt))
+        cur = nxt
+    return out
+
+
+def merge_shards(dirs: list[str], results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine day-shard replays into one result (trades/orders pooled, decisions summed)."""
+    from analytics.decisions import decision_table
+    from backtest.replay import execution_stats, performance_with_extras
+    from data.database import Database
+
+    trades: list[dict] = []
+    orders: list[dict] = []
+    for i, d in enumerate(dirs):
+        path = os.path.join(d, "replay.sqlite")
+        if not os.path.exists(path):
+            continue
+        db = Database(path)
+        try:
+            trades += db.query("SELECT * FROM trades")
+            orders += [dict(o, client_id=f"{i}:{o['client_id']}") for o in db.query("SELECT * FROM orders ORDER BY id")]
+        finally:
+            db.close()
+    trades.sort(key=lambda t: t["entry_ts_ms"])
+    decisions: dict[str, int] = {}
+    malformed: dict[str, int] = {}
+    evaluations = 0
+    for r in results:
+        evaluations += r.get("evaluations", 0)
+        for row in r.get("decisions", []):
+            decisions[row["reason"]] = decisions.get(row["reason"], 0) + row["count"]
+        for k, v in r.get("feed_health", {}).get("malformed_by_kind", {}).items():
+            malformed[k] = malformed.get(k, 0) + v
+    return {"performance": performance_with_extras(trades), "execution": execution_stats(orders),
+            "decisions": decision_table(decisions), "evaluations": evaluations,
+            "feed_health": {"malformed_by_kind": malformed}, "dirs": dirs,
+            "wall_s": round(sum(r.get("_wall", 0) for r in results), 1)}
+
+
+class Runner:
+    """Expands segment runs into day shards, executes all shards in one process pool."""
+
+    def __init__(self, events: str, out: str, bounds: dict[str, tuple[int, int]], symbols: list[str],
+                 warmup_ms: int, workers: int) -> None:
+        self.events, self.out, self.bounds = events, out, bounds
+        self.symbols, self.warmup_ms, self.workers = symbols, warmup_ms, workers
+
+    def run(self, requests: list[tuple[BotConfig, str, str, str, dict]]) -> list[dict[str, Any]]:
+        """requests: (cfg, segment, sub_dir, label, extra ReplaySpec kwargs)."""
+        jobs, groups = [], []
+        for cfg, seg, sub, label, extra in requests:
+            s, e = self.bounds[seg]
+            idx = []
+            for a, b in day_shards(s, e):
+                start = a + self.warmup_ms if a % DAY_MS == 0 else a   # warm up on same-day data
+                if start >= b:
+                    continue
+                d = os.path.join(self.out, seg, sub, datetime.fromtimestamp(a / 1000, tz=timezone.utc)
+                                 .strftime("%Y%m%d_%H%M"))
+                spec = {"events_dir": self.events, "out_dir": d, "start_ms": start, "end_ms": b,
+                        "warmup_ms": self.warmup_ms, "symbols": self.symbols, **extra}
+                idx.append(len(jobs))
+                jobs.append((cfg, spec, label))
+            groups.append(idx)
+        log.info("running %d shard replays (%d requests, workers=%d)", len(jobs), len(requests), self.workers)
+        results = run_many(jobs, self.workers)
+        return [merge_shards([jobs[i][1]["out_dir"] for i in g], [results[i] for i in g]) for g in groups]
+
+
+def load_many(dirs: list[str]):
+    import pandas as pd
+
+    from research import analysis as A
+
+    ts, ss = [], []
+    for d in dirs:
+        p = os.path.join(d, "replay.sqlite")
+        if os.path.exists(p):
+            t, s = A.load(p)
+            ts.append(t)
+            ss.append(s)
+    trades = pd.concat(ts, ignore_index=True) if ts else pd.DataFrame()
+    signals = pd.concat(ss, ignore_index=True).sort_values("ts_ms") if ss else pd.DataFrame()
+    return trades, signals
+
+
 # ---------------------------------------------------------------------- protocol
 def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_combos: int | None,
              workers: int, symbols: list[str], fractions=(0.6, 0.2, 0.2), top_k: int = 5,
              min_trades: int = 30, final_test: bool = False, force_retest: bool = False,
              latencies: list[int] = LATENCIES, warmup_ms: int = 120_000) -> dict[str, Any]:
+    import pandas as pd
+
+    from research import analysis as A
+
     os.makedirs(out, exist_ok=True)
-    rng = EventReader(events).time_range()
+    rng = open_reader(events, symbols=symbols or None).time_range()
     if rng is None:
         raise SystemExit("no events found")
-    bounds = split_bounds(rng[0] + warmup_ms, rng[1], fractions)
+    t0, t1 = rng[0], rng[1] + 1
+    bounds = split_bounds(t0, t1, fractions)
+    if t1 - t0 >= 3 * DAY_MS:      # multi-day data: split on whole UTC days
+        snap = lambda x: int(round(x / DAY_MS)) * DAY_MS   # noqa: E731
+        bounds = {"train": (t0, snap(bounds["train"][1])),
+                  "validation": (snap(bounds["validation"][0]), snap(bounds["validation"][1])),
+                  "test": (snap(bounds["test"][0]), t1)}
     report: dict[str, Any] = {"events": events, "bounds": bounds, "symbols": symbols,
                               "grid": grid, "min_trades": min_trades, "created": time.time()}
     base = copy.deepcopy(cfg)
     base.execution.sim_latency_ms = PRIMARY_LATENCY
+    R = Runner(events, out, bounds, symbols, warmup_ms, workers)
 
-    def spec(seg: str, sub: str) -> dict[str, Any]:
-        s, e = bounds[seg]
-        return {"events_dir": events, "out_dir": os.path.join(out, seg, sub), "start_ms": s, "end_ms": e,
-                "warmup_ms": warmup_ms, "symbols": symbols}
-
-    # -- 2. baseline on TRAIN with research recording + min-edge sampling
-    from research import analysis as A
-
-    log.info("baseline replay on TRAIN %s", bounds["train"])
-    obs = A.MinEdgeObserver()
-    bspec = ReplaySpec(**spec("train", "baseline"), label="baseline", observers=[(1000, obs)])
-    bres = run_replay(research_cfg(base), bspec)
-    trades, signals = A.load(os.path.join(out, "train", "baseline", "replay.sqlite"))
+    # -- 2. baseline (research recording) + 3. sweep, all on TRAIN, in one pool
+    cands = combos(grid, max_combos) if grid else []     # empty grid: research-only run
+    report["research_only"] = not cands
+    log.info("TRAIN %s: baseline + %d sweep configurations", bounds["train"], len(cands))
+    reqs = [(research_cfg(base), "train", "baseline", "baseline", {"min_edge": True})]
+    reqs += [(apply(base, c), "train", f"sweep_{i:03d}", json.dumps(c), {}) for i, c in enumerate(cands)]
+    res = R.run(reqs)
+    bres, train_res = res[0], res[1:]
+    trades, signals = load_many(bres["dirs"])
+    me = [pd.read_csv(os.path.join(d, "min_edge.csv")) for d in bres["dirs"]
+          if os.path.exists(os.path.join(d, "min_edge.csv"))]
+    me_df = pd.concat(me, ignore_index=True) if me else pd.DataFrame()
     report["baseline_train"] = {
         "metrics": metrics(bres), "decisions": bres["decisions"][:25], "evaluations": bres["evaluations"],
         "feed_health": bres["feed_health"]["malformed_by_kind"],
         "per_symbol": A.per_symbol(trades, signals).to_dict("records"),
         "calibration": A.calibration(signals),
         "features": A.feature_analysis(signals, base.costs.maker_fee, base.costs.taker_fee),
-        "min_edge": A.min_edge_summary(obs.frame(), signals),
+        "min_edge": A.min_edge_summary(me_df, signals),
     }
-
-    # -- 3. sweep on TRAIN
-    cands = combos(grid, max_combos)
-    log.info("sweep: %d configurations on TRAIN (workers=%d)", len(cands), workers)
-    jobs = [(apply(base, c), spec("train", f"sweep_{i:03d}"), json.dumps(c)) for i, c in enumerate(cands)]
-    train_res = run_many(jobs, workers)
     sweep = []
     for c, r in zip(cands, train_res):
         m = metrics(r)
@@ -205,9 +304,9 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
     top = [s for s in ranked if s["eligible"]][:top_k]
     if not top:
         log.warning("no configuration reached %d trades on TRAIN", min_trades)
-    vjobs = [(apply(base, s["params"]), spec("validation", f"cand_{i}"), json.dumps(s["params"]))
-             for i, s in enumerate(top)]
-    for s, r in zip(top, run_many(vjobs, workers)):
+    vres = R.run([(apply(base, s["params"]), "validation", f"cand_{i}", json.dumps(s["params"]), {})
+                  for i, s in enumerate(top)]) if top else []
+    for s, r in zip(top, vres):
         s["validation"] = metrics(r)
     valid = [s for s in top if (s["validation"]["trades"] or 0) >= max(10, min_trades // 3)]
     chosen = max(valid, key=lambda s: s["validation"]["expectancy"] or -1e9) if valid else None
@@ -215,9 +314,9 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
     report["chosen"] = chosen
     if chosen is not None:
         ccfg = apply(base, chosen["params"])
-        ljobs = [(apply(ccfg, {"latency_ms": lat}), spec("validation", f"latency_{lat}"), f"lat{lat}")
-                 for lat in latencies]
-        report["validation_latency"] = {lat: metrics(r) for lat, r in zip(latencies, run_many(ljobs, workers))}
+        lres = R.run([(apply(ccfg, {"latency_ms": lat}), "validation", f"latency_{lat}", f"lat{lat}", {})
+                      for lat in latencies])
+        report["validation_latency"] = {lat: metrics(r) for lat, r in zip(latencies, lres)}
         report["chosen_config_hash"] = config_hash(ccfg)
         with open(os.path.join(out, "chosen_config.json"), "w", encoding="utf-8") as fh:
             json.dump(asdict(ccfg) | {"exchange": {}}, fh, indent=1, default=str)
@@ -240,11 +339,11 @@ def validate(cfg: BotConfig, events: str, out: str, grid: dict[str, list], max_c
                 json.dump({"config_hash": h, "params": chosen["params"], "at": time.time(),
                            "forced": bool(force_retest)}, fh, indent=1)
             ccfg = apply(base, chosen["params"])
-            tjobs = [(apply(research_cfg(ccfg), {"latency_ms": lat}), spec("test", f"latency_{lat}"), f"test{lat}")
-                     for lat in latencies]
-            tres = dict(zip(latencies, run_many(tjobs, workers)))
-            report["test"] = {lat: metrics(r) for lat, r in tres.items()}
-            ttrades, tsignals = A.load(os.path.join(out, "test", f"latency_{PRIMARY_LATENCY}", "replay.sqlite"))
+            tres = R.run([(apply(research_cfg(ccfg), {"latency_ms": lat}), "test", f"latency_{lat}", f"test{lat}", {})
+                          for lat in latencies])
+            report["test"] = {lat: metrics(r) for lat, r in zip(latencies, tres)}
+            prim = tres[latencies.index(PRIMARY_LATENCY)] if PRIMARY_LATENCY in latencies else tres[0]
+            ttrades, tsignals = load_many(prim["dirs"])
             report["test_per_symbol"] = A.per_symbol(ttrades, tsignals).to_dict("records")
             report["test_calibration"] = A.calibration(tsignals)
     else:
@@ -280,6 +379,10 @@ def ineffective_params(sweep: list[dict[str, Any]]) -> list[str]:
 
 def verdict(report: dict[str, Any], min_trades: int) -> str:
     feats = report.get("baseline_train", {}).get("features", {}).get("verdict", "")
+    if report.get("research_only"):
+        m = report.get("baseline_train", {}).get("metrics", {})
+        return (f"RESEARCH ONLY (no parameter selection, TEST untouched). Feature analysis: {feats}. "
+                f"Strategy as configured on TRAIN: {m.get('trades')} trades, expectancy {m.get('expectancy')} USDT/trade.")
     chosen = report.get("chosen")
     test = report.get("test", {})
     if chosen is None:
@@ -317,6 +420,8 @@ def main() -> None:
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--min-trades", type=int, default=30)
     ap.add_argument("--latencies", nargs="*", type=int, default=LATENCIES)
+    ap.add_argument("--research-only", action="store_true",
+                    help="baseline analyses on TRAIN only (features, calibration, min edge); no sweep/test")
     ap.add_argument("--final-test", action="store_true")
     ap.add_argument("--force-retest", action="store_true")
     args = ap.parse_args()
@@ -325,7 +430,9 @@ def main() -> None:
         logging.getLogger(noisy).setLevel(logging.ERROR)
     cfg = load_config(args.config)
     grid = DEFAULT_GRID
-    if args.grid:
+    if args.research_only:
+        grid = {}
+    elif args.grid:
         with open(args.grid, encoding="utf-8") as fh:
             grid = json.load(fh)
     rep = validate(cfg, args.events, args.out, grid, args.max_combos, args.workers, args.symbols,

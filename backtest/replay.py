@@ -40,7 +40,7 @@ from analytics.performance import compute_performance
 from backtest.virtual_loop import LoopClock, VirtualTimeEventLoop
 from config import BotConfig, load_config
 from data.database import Database
-from data.event_store import EventReader, load_meta
+from data.event_store import load_meta, open_reader
 from exchange.models import SymbolInfo
 
 log = logging.getLogger("replay")
@@ -63,6 +63,8 @@ class ReplaySpec:
     seed: int = 12345
     observers: list[tuple[int, Observer]] = field(default_factory=list)   # (interval_ms, fn)
     label: str = ""
+    fast_clock: bool = True              # skip loop iterations between timers (same semantics)
+    min_edge: bool = False               # sample the minimum tradable edge -> out_dir/min_edge.csv
 
 
 def _prepare_config(cfg: BotConfig, spec: ReplaySpec, meta: dict) -> BotConfig:
@@ -107,15 +109,22 @@ def run_replay(cfg: BotConfig, spec: ReplaySpec) -> dict[str, Any]:
         raise ValueError(f"config problems: {problems}")
 
     first_ts = spec.start_ms - spec.warmup_ms if spec.start_ms is not None else None
-    reader = EventReader(spec.events_dir, start_ms=first_ts, end_ms=spec.end_ms,
+    reader = open_reader(spec.events_dir, start_ms=first_ts, end_ms=spec.end_ms,
                          time_source=spec.time_source, feed_latency_ms=spec.feed_latency_ms,
-                         reorder_window_ms=spec.reorder_window_ms)
+                         reorder_window_ms=spec.reorder_window_ms, symbols=spec.symbols or None)
     events = iter(reader)
     try:
         first = next(events)
     except StopIteration:
         return {"error": "no events in range", "spec": _spec_dict(spec)}
 
+    observers = list(spec.observers)
+    min_edge_obs = None
+    if spec.min_edge:
+        from research.analysis import MinEdgeObserver
+
+        min_edge_obs = MinEdgeObserver()
+        observers.append((1000, min_edge_obs))
     loop = VirtualTimeEventLoop(start_ms=first.ts, speed=spec.speed)
     asyncio.set_event_loop(loop)
     clock = LoopClock(loop)
@@ -134,11 +143,13 @@ def run_replay(cfg: BotConfig, spec: ReplaySpec) -> dict[str, Any]:
     async def drive() -> None:
         await bot.start_core(info if info else None)
         bot.active_from_ms = active_from
-        obs_tasks = [asyncio.ensure_future(observe(i, fn)) for i, fn in spec.observers]
+        obs_tasks = [asyncio.ensure_future(observe(i, fn)) for i, fn in observers]
         ev = first
         last_ts = first.ts
+        fast = spec.fast_clock
         while ev is not None:
-            await loop.sleep_until_ms(ev.ts)
+            if not (fast and loop.try_advance_ms(ev.ts)):
+                await loop.sleep_until_ms(ev.ts)
             stats["events"] += 1
             last_ts = ev.ts
             if ev.conn == "market":
@@ -164,6 +175,8 @@ def run_replay(cfg: BotConfig, spec: ReplaySpec) -> dict[str, Any]:
         asyncio.set_event_loop(None)
         loop.close()
 
+    if min_edge_obs is not None:
+        min_edge_obs.frame().to_csv(os.path.join(spec.out_dir, "min_edge.csv"), index=False)
     result = summarize(db_path, bot, stats, reader, spec, active_from, wall0)
     with open(os.path.join(spec.out_dir, "result.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=1, default=str)
@@ -195,15 +208,7 @@ def execution_stats(orders: list[dict]) -> dict[str, Any]:
     }
 
 
-def summarize(db_path: str, bot, stats: dict, reader: EventReader, spec: ReplaySpec,
-              active_from: int, wall0: float) -> dict[str, Any]:
-    db = Database(db_path)
-    try:
-        trades = db.query("SELECT * FROM trades ORDER BY entry_ts_ms")
-        orders = db.query("SELECT * FROM orders ORDER BY id")
-        n_signals = db.query("SELECT COUNT(*) AS n FROM signals")[0]["n"]
-    finally:
-        db.close()
+def performance_with_extras(trades: list[dict]) -> dict[str, Any]:
     perf = compute_performance(trades)
     nets = sorted(t["net_pnl"] for t in trades)
     if nets:
@@ -212,6 +217,19 @@ def summarize(db_path: str, bot, stats: dict, reader: EventReader, spec: ReplayS
         hits = sum(1 for t in trades if t["exit_reason"] in ("target_profit", "trailing_stop"))
         stops = sum(1 for t in trades if t["exit_reason"] == "stop_loss")
         perf["target_before_stop_rate"] = round(hits / (hits + stops), 4) if hits + stops else None
+    return perf
+
+
+def summarize(db_path: str, bot, stats: dict, reader, spec: ReplaySpec,
+              active_from: int, wall0: float) -> dict[str, Any]:
+    db = Database(db_path)
+    try:
+        trades = db.query("SELECT * FROM trades ORDER BY entry_ts_ms")
+        orders = db.query("SELECT * FROM orders ORDER BY id")
+        n_signals = db.query("SELECT COUNT(*) AS n FROM signals")[0]["n"]
+    finally:
+        db.close()
+    perf = performance_with_extras(trades)
     span_ms = max(stats.get("last_ts", active_from) - active_from, 0)
     return {
         "label": spec.label,

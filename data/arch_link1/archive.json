@@ -1,0 +1,28 @@
+{
+ "source": "binance_public_archive_L1",
+ "depth_mode": "bbo",
+ "days": [
+  "2024-03-25"
+ ],
+ "symbol_info": {
+  "LINKUSDT": {
+   "symbol": "LINKUSDT",
+   "tick_size": 0.001,
+   "step_size": 0.01,
+   "min_qty": 0.01,
+   "min_notional": 5.0,
+   "max_qty": 1000000000000.0
+  }
+ },
+ "files": {
+  "LINKUSDT": {
+   "aggTrades": [
+    "/home/user/Hehehaha/data/archive_raw/LINKUSDT/LINKUSDT-aggTrades-2024-03-25.zip"
+   ],
+   "bookTicker": [
+    "/home/user/Hehehaha/data/archive_raw/LINKUSDT/LINKUSDT-bookTicker-2024-03-25.zip"
+   ]
+  }
+ },
+ "missing": []
+}

@@ -13,7 +13,6 @@ speed=k     -> k-times accelerated
 from __future__ import annotations
 
 import asyncio
-import math
 import selectors
 import time
 
@@ -33,7 +32,9 @@ class _VirtualSelector(selectors.DefaultSelector):
     def select(self, timeout=None):
         loop = self.loop
         if loop is not None and timeout is not None and timeout > 0:
-            step_us = math.ceil(timeout * 1e6)
+            # Round (not ceil): timer deadlines are whole microseconds, so rounding lands
+            # exactly on them -- ceil overshot by 1us and made periodic loops drift.
+            step_us = max(1, round(timeout * 1e6))
             if loop.speed:
                 time.sleep(timeout / loop.speed)
             loop._vt_us += step_us
@@ -61,6 +62,25 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
 
     def now_ms(self) -> int:
         return self._vt_us // 1000
+
+    def try_advance_ms(self, ts_ms: int) -> bool:
+        """Fast path: jump the clock to ``ts_ms`` without a loop iteration.
+
+        Only valid when nothing is ready to run and no timer is due at or before the
+        target time -- then a sleep would do exactly this and nothing else. Returns False
+        (caller must ``await sleep_until_ms``) otherwise.
+        """
+        target_us = int(ts_ms) * 1000
+        if target_us <= self._vt_us:
+            return not self._ready
+        if self._ready:
+            return False
+        if self._scheduled:
+            first = self._scheduled[0]
+            if first._when * 1e6 + self._origin_us <= target_us + 1:
+                return False
+        self._vt_us = target_us
+        return True
 
     async def sleep_until_ms(self, ts_ms: int) -> None:
         """Advance simulated time to ``ts_ms`` (running every timer due before it)."""

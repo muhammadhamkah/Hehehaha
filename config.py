@@ -161,6 +161,7 @@ class EntryConfig:
     min_book_imbalance: float = -1.0      # direction * imb_weighted must be >= this
     min_flow_imbalance: float = -1.0      # direction * flow_imb_3s must be >= this
     max_book_imbalance_abs: float = 0.97  # reject near-one-sided books (likely abnormal)
+    min_liquidity_change: float = -0.5    # reject if top-10 depth fell >50% vs its 10s average
     min_trades_per_s: float = 1.0
     max_realized_vol_bps_1s: float = 15.0 # abnormal volatility guard
 
@@ -310,6 +311,8 @@ class BotConfig:
 def _merge(dc: Any, overrides: dict[str, Any]) -> None:
     names = {f.name: f for f in fields(dc)}
     for key, value in overrides.items():
+        if key.startswith("_"):
+            continue  # comment keys in JSON configs
         if key not in names:
             raise KeyError(f"unknown config key {key!r} for {type(dc).__name__}")
         current = getattr(dc, key)

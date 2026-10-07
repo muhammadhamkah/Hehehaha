@@ -80,7 +80,7 @@ class EntryFilter:
             return EntryDecision(False, "abnormal_book_one_sided")
         if f.get("rv_1s_bps", 0.0) > e.max_realized_vol_bps_1s:
             return EntryDecision(False, "abnormal_volatility")
-        if f.get("liquidity_change", 0.0) < -0.5:
+        if f.get("liquidity_change", 0.0) < e.min_liquidity_change:
             return EntryDecision(False, "liquidity_withdrawal")
         if f.get("trades_per_s_10s", 0.0) < e.min_trades_per_s:
             return EntryDecision(False, "thin_tape")

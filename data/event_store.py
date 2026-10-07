@@ -134,6 +134,10 @@ def list_event_files(root: str) -> list[str]:
 
 
 def load_meta(root: str) -> dict:
+    manifest = os.path.join(root, "archive.json")
+    if os.path.exists(manifest):
+        with open(manifest, encoding="utf-8") as fh:
+            return json.load(fh)
     path = os.path.join(root, "meta.json")
     if not os.path.exists(path):
         return {}
@@ -221,3 +225,14 @@ class EventReader:
             lo = ev.ts if lo is None else min(lo, ev.ts)
             hi = ev.ts if hi is None else max(hi, ev.ts)
         return (lo, hi) if lo is not None else None
+
+
+def open_reader(root: str, **kw):
+    """EventReader for recorded events, ArchiveReader for a public-archive manifest dir."""
+    from data.archive_reader import ArchiveReader, is_archive_dir
+
+    if is_archive_dir(root):
+        kw.pop("reorder_window_ms", None)
+        return ArchiveReader(root, **kw)
+    kw.pop("symbols", None)
+    return EventReader(root, **kw)
