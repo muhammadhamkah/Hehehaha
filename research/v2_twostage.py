@@ -424,7 +424,7 @@ def export_twostage(out_dir: str, kind: str, cols: list[str], A, B, sel: dict, s
 
 # ====================================================================== dynamic target study
 def dynamic_targets(se: pd.DataFrame, ca: pd.DataFrame, A: dict, B: dict, xse, xca, stop: int, notional: int,
-                    strength_X: int = 20) -> dict[str, Any]:
+                    strength_X: int = 20, targets=TRADE_TARGETS) -> dict[str, Any]:
     """Strength = Stage-A P(|move| >= 20 bps, 60 s). Buckets from CAL quantiles; best T chosen on SEL."""
     pa_ca = A[strength_X]["model"].predict(xca)
     q = np.quantile(pa_ca, [0.90, 0.97, 0.99])
@@ -437,7 +437,7 @@ def dynamic_targets(se: pd.DataFrame, ca: pd.DataFrame, A: dict, B: dict, xse, x
         m = bucket == b
         r = {"bucket": name, "n": int(m.sum())}
         best = ("skip", 0.0)
-        for T in TRADE_TARGETS:
+        for T in targets:
             pb = B[T]["cal"](B[T]["model"].predict(xse[m]))
             side_long = pb >= 0.5
             net = np.where(side_long,
@@ -496,6 +496,8 @@ def main() -> None:
     ap.add_argument("--min-net", type=float, default=0.10)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--xgb", action="store_true", help="also fit the two-stage XGBoost pipeline")
+    ap.add_argument("--grid-x", nargs="+", type=int, default=list(XS))
+    ap.add_argument("--grid-h", nargs="+", type=int, default=list(HS))
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from config import CostConfig
@@ -536,7 +538,8 @@ def main() -> None:
     B: dict[str, dict] = {k: {} for k in kinds_run}
     rep["stage_a"], rep["stage_b"] = {}, {}
     for kind in kinds_run:
-        grid = [(X, H) for X in XS for H in HS] if kind == "lightgbm" else [(X, 60) for X in TRADE_TARGETS]
+        grid = [(X, H) for X in args.grid_x for H in args.grid_h] if kind == "lightgbm" else \
+            [(X, 60) for X in TRADE_TARGETS if X in args.grid_x]
         for X, H in grid:
             tk = time.perf_counter()
             a = stage_a(kind, tr, ca, se, xtr, xca, xse, X, H, args.threads)
@@ -593,9 +596,11 @@ def main() -> None:
     save()
 
     # ---- dynamic target study (validation only)
-    rep["dynamic_targets"] = dynamic_targets(
-        se, ca, {X: A["lightgbm"][(X, 60)] for X in TRADE_TARGETS}, {X: B["lightgbm"][(X, 60)] for X in TRADE_TARGETS},
-        xse, xca, args.stop, int(args.notional))
+    both = [X for X in TRADE_TARGETS if (X, 60) in A["lightgbm"] and (X, 60) in B["lightgbm"]]
+    if 20 in both:
+        rep["dynamic_targets"] = dynamic_targets(
+            se, ca, {X: A["lightgbm"][(X, 60)] for X in both}, {X: B["lightgbm"][(X, 60)] for X in both},
+            xse, xca, args.stop, int(args.notional), targets=both)
     save()
 
     # ---- combined rule: thresholds chosen on SEL; export for the replay
