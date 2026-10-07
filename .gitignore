@@ -23,3 +23,5 @@ runs_v2_models.sh
 runs_v2_restart.sh
 v2_dataset_t15.log
 v2_models_xgb_mlp.log
+runs_v2_twostage.sh
+v2_twostage.log
