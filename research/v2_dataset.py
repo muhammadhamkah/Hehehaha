@@ -46,7 +46,7 @@ from strategy.costs import CostModel
 
 log = logging.getLogger("v2ds")
 
-TARGETS_BPS = (8, 10, 12, 14, 16, 18, 20, 25, 30)
+TARGETS_BPS = (8, 10, 12, 14, 15, 16, 18, 20, 25, 30)
 STOPS_BPS = (6, 8, 10, 12, 15)
 RET_HORIZONS_S = (1, 3, 5, 10, 30, 60)
 NOTIONALS = (100, 150, 250)
