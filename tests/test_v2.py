@@ -152,3 +152,30 @@ def test_barrier_exit_mode():
     assert ee.update(pos(), 99.91, 99.92, f, None, 1000).reason == "stop_loss"
     assert ee.update(pos(), 100.05, 100.06, f, None, 10_000) is None    # no V1 reversal/trailing exits
     assert ee.update(pos(), 100.05, 100.06, f, None, 31_000).reason == "time_stop"
+
+
+def test_compare_runner_and_test_lock(v2_setup, tmp_path, monkeypatch):
+    import json
+    import sys
+
+    from research import compare_v1_v2 as C
+
+    ev, ds, out, rep = v2_setup
+    o = str(tmp_path / "cmp")
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps({"entry": {"min_net_profit_usdt": 0.01, "min_depth_usdt_within_10bps": 0.0}}))
+    argv = ["x", "--events", ev, "--out", o, "--base-config", str(base), "--v2-models", out,
+            "--kinds", "lightgbm", "--symbols", "SYN0USDT", "SYN1USDT", "--val-days", DAYS[1],
+            "--test-days", DAYS[2], "--window", "0", "1", "--workers", "1", "--final-test"]
+    monkeypatch.setattr(sys, "argv", argv)
+    C.main()
+    r = json.load(open(os.path.join(o, "comparison.json")))
+    assert set(r["test"]) == {"V1 rule-based", "V2 lightgbm"}
+    assert "V2 lightgbm" in r["validation_research_only"]
+    assert os.path.exists(os.path.join(o, "V1_VS_V2.md"))
+    lock = json.load(open(os.path.join(o, "test_lock.json")))
+    assert set(lock) == {"V1 rule-based", "V2 lightgbm"}
+    # a CHANGED frozen config may not be evaluated on the same test period
+    base.write_text(json.dumps({"entry": {"min_net_profit_usdt": 0.02, "min_depth_usdt_within_10bps": 0.0}}))
+    with pytest.raises(SystemExit):
+        C.main()
