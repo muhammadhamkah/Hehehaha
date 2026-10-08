@@ -43,6 +43,94 @@
   "dir_acc_given_move": 0.6,
   "sel_rows_flagged": 45
  },
+ "direct_xgboost_T20": {
+  "trades": 10,
+  "net_pnl": -1.3685,
+  "expectancy": -0.13685,
+  "t_stat": -2.04,
+  "win_rate": 0.4,
+  "profit_factor": 0.242,
+  "avg_winner": 0.1093,
+  "avg_loser": -0.301,
+  "median_trade": -0.30098,
+  "max_drawdown": 1.3685,
+  "tp_before_sl_rate": 0.3,
+  "avg_hold_s": 14.68,
+  "costs_per_trade": 0.1816,
+  "long_share": 0.3,
+  "targets_used": {
+   "20": 10
+  },
+  "large_move_rate": 0.7,
+  "dir_acc_given_move": 0.4286,
+  "sel_rows_flagged": 28
+ },
+ "direct_xgboost_T25": {
+  "trades": 9,
+  "net_pnl": -2.214,
+  "expectancy": -0.246,
+  "t_stat": -4.47,
+  "win_rate": 0.1111,
+  "profit_factor": 0.081,
+  "avg_winner": 0.194,
+  "avg_loser": -0.301,
+  "median_trade": -0.301,
+  "max_drawdown": 2.408,
+  "tp_before_sl_rate": 0.1111,
+  "avg_hold_s": 7.69,
+  "costs_per_trade": 0.1833,
+  "long_share": 1.0,
+  "targets_used": {
+   "25": 9
+  },
+  "large_move_rate": 1.0,
+  "dir_acc_given_move": 0.4444,
+  "sel_rows_flagged": 27
+ },
+ "direct_mlp_T20": {
+  "trades": 59,
+  "net_pnl": -9.3015,
+  "expectancy": -0.15765,
+  "t_stat": -6.15,
+  "win_rate": 0.322,
+  "profit_factor": 0.196,
+  "avg_winner": 0.1191,
+  "avg_loser": -0.2891,
+  "median_trade": -0.30089,
+  "max_drawdown": 9.4206,
+  "tp_before_sl_rate": 0.322,
+  "avg_hold_s": 12.38,
+  "costs_per_trade": 0.1808,
+  "long_share": 0.78,
+  "targets_used": {
+   "20": 59
+  },
+  "large_move_rate": 0.7288,
+  "dir_acc_given_move": 0.6047,
+  "sel_rows_flagged": 80
+ },
+ "direct_mlp_T25": {
+  "trades": 106,
+  "net_pnl": -15.7143,
+  "expectancy": -0.14825,
+  "t_stat": -7.1,
+  "win_rate": 0.2736,
+  "profit_factor": 0.256,
+  "avg_winner": 0.1868,
+  "avg_loser": -0.2744,
+  "median_trade": -0.29421,
+  "max_drawdown": 15.7143,
+  "tp_before_sl_rate": 0.2453,
+  "avg_hold_s": 17.57,
+  "costs_per_trade": 0.1814,
+  "long_share": 0.896,
+  "targets_used": {
+   "25": 106
+  },
+  "large_move_rate": 0.6509,
+  "dir_acc_given_move": 0.5797,
+  "sel_rows_flagged": 162
+ },
  "twostage_lightgbm_T20": {
   "trades": 1,
   "net_pnl": -0.3149,

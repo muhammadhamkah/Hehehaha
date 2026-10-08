@@ -208,16 +208,17 @@ Every bucket and target is negative, so the validation-chosen mapping is "skip" 
 | Model | gated trades | forced trades | target hit rate (P(TP)) | large-move rate | direction acc. given move | net / trade (USDT) | PF | max DD (USDT) | total net (USDT) | inference median / p99 per decision |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Direct LightGBM (18 models) | 0 | 12 | 0.17 | 0.83 | 0.60 (n=10) | −0.218 | 0.13 | 2.62 | −2.62 | 1.23 ms / 2.59 ms |
-| Direct XGBoost | *pending* | | | | | | | | | |
-| Direct MLP | *pending* | | | | | | | | | |
+| Direct XGBoost (18 models) | 0 | 9 | 0.11 | 1.00 | 0.44 (n=9) | −0.246 | 0.08 | 2.41 | −2.21 | 4.54 ms / 8.04 ms |
+| Direct MLP 64→32 (8 models) | 0 | 106 | 0.25 | 0.65 | 0.58 (n=69) | −0.148 | 0.26 | 15.71 | −15.71 | 0.47 ms / 0.71 ms |
 | Two-stage LightGBM (8 models) | 0 | 3 | 0.33 | 1.00 | 1.00 (n=3) | −0.136 | 0.32 | 0.60 | −0.41 | 0.45 ms / 1.38 ms |
 | Two-stage XGBoost (8 models) | 0 | 3 | 0.33 | 1.00 | 1.00 (n=3) | −0.136 | 0.32 | 0.60 | −0.41 | 1.29 ms / 3.78 ms |
 | (V1 rule-based, locked test) | 10 on test | – | 0.00 | – | – | −0.141 | 0 | – | −1.41 | – |
 
-- **T20 forced:** direct LightGBM 28 trades, −0.162/trade, PF 0.18. Two-stage LightGBM 1 trade, −0.315. Two-stage XGBoost 6 trades, −0.161.
+- **T20 forced:** direct LightGBM 28 trades, −0.162/trade, PF 0.18. Direct XGBoost 10 trades, −0.137. Direct MLP 59 trades, −0.158 (t −6.2). Two-stage LightGBM 1 trade, −0.315. Two-stage XGBoost 6 trades, −0.161.
+- **Direct-model selection-day AUC (long/short):** T20: LightGBM 0.767/0.707, XGBoost 0.768/0.708, MLP 0.751/0.696. T25: LightGBM 0.809/0.740, XGBoost 0.809/0.742, MLP 0.779/0.734. All three direct families converge on the same volatility signal.
+- **Direct MLP picks:** 90% long. Its 0.58 direction accuracy is the selection day's upward drift inside those trades, not skill; it still loses −0.148 per trade.
 - **Sample sizes:** the forced samples are tiny because the selection day was calmer than the calibration day. Larger slices (§5, thousands of rows) give the same answer with |t| > 8.
-- **Direct XGBoost / MLP:** the single-stage study was killed by two container restarts. It is running again, and its rows will be added when it finishes. The verdict cannot change: the classification rests on the direction diagnostics above, which are model-independent.
-- **Latency:** none of the models meets the < 100 µs preference. Two-stage LightGBM is the fastest full decision (~0.45 ms), because Stage B runs only when Stage A passes.
+- **Latency:** none of the models meets the < 100 µs preference. The fastest full decisions are two-stage LightGBM (~0.45 ms; Stage B runs only when Stage A passes) and direct MLP (~0.47 ms). Direct XGBoost is slowest (~4.5 ms for 18 boosters).
 
 ## 10. Conclusions and recommendation
 
