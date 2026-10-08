@@ -29,8 +29,24 @@ is blocked (HTTP 451 / 403), so recording has to run on your own machine or a VP
 python -m tools.validate_binance --symbols 5 --duration 60 --out validation_report.json
 ```
 
-Every check should PASS, especially `diff_depth_sync`. If Binance has changed its websocket base
-URL or stream paths, pass the new ones to the recorder with `--ws-base` / `--rest-base`.
+Every check should PASS, especially `diff_depth_sync`. Then confirm which websocket address carries
+each stream the recorder needs:
+
+```bash
+python -m tools.probe_ws
+```
+
+Binance has been moving futures streams to separate paths, for example `/public` for order-book
+streams and `/market` for trades and tickers. On the first real setup, `aggTrade` was silent on
+the legacy base URL. The probe prints the exact flags to add to the recorder command:
+`--ws-depth-base`, `--ws-bookticker-base` and `--ws-trades-base`.
+
+The recorder also protects itself:
+
+- **A stream never arrives:** if any stream (diff depth, bookTicker or aggTrade) has delivered
+  nothing for any symbol after 2 minutes, it stops with reason `stream_never_arrived`.
+- **A stream goes quiet later:** a silent minute is logged and marked in the store
+  (`__gap__`, reason `stream_silent`).
 
 ## 3. Record — recommended initial run (130 GB machine)
 

@@ -493,3 +493,79 @@ def test_recorder_stops_when_storage_disappears(tmp_path):
 
     rec = asyncio.run(go())
     assert rec.stop_reason == "write_error"
+
+
+def _mock_with_paths(drop_kind=None):
+    from aiohttp import web
+    from tests.mock_binance import MockBinanceServer
+
+    class S(MockBinanceServer):
+        def payload(self, stream):
+            return super().payload(stream)
+
+        async def _send(self, ws, subs):
+            while not ws.closed:
+                for s in sorted(subs):
+                    if drop_kind and s.endswith(drop_kind):
+                        continue                       # this stream family is silent on this server
+                    await ws.send_str(json.dumps({"stream": s, "data": self.payload(s)}))
+                await asyncio.sleep(0.05)
+
+        async def start(self):
+            app = web.Application()
+            app.router.add_get("/fapi/v1/time", self.time)
+            app.router.add_get("/fapi/v1/exchangeInfo", self.exchange_info)
+            app.router.add_get("/fapi/v1/depth", self.depth)
+            app.router.add_get("/stream", self.ws)
+            app.router.add_get("/market/stream", self.ws)      # split-path layout
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            return runner, f"127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+    return S()
+
+
+def test_recorder_routes_streams_to_separate_bases(tmp_path):
+    from data.event_store import open_reader
+    from v3.recorder import L2Recorder, RecorderConfig
+    out = str(tmp_path / "l2")
+
+    async def go():
+        srv = _mock_with_paths()
+        runner, host = await srv.start()
+        cfg = RecorderConfig(out=out, symbols=("BTCUSDT",), rest_base=f"http://{host}", ws_base=f"ws://{host}",
+                             ws_trades_base=f"ws://{host}/market", duration_s=3.0, health_interval_s=1.0,
+                             min_free_gb=0.0, max_gb=None, partial_stream="", compress=False, stream_check_s=1.5,
+                             resync_delay_s=0.1)
+        rec = L2Recorder(cfg)
+        await rec.run()
+        await runner.cleanup()
+        return rec
+
+    rec = asyncio.run(go())
+    assert len(rec.conns) == 2 and rec.stop_reason == ""
+    assert any(c.url.endswith("/market/stream") and c.streams == {"btcusdt@aggTrade"} for c in rec.conns.values())
+    kinds = {ev.stream.split("@", 1)[1] for ev in open_reader(out) if not ev.stream.startswith("__")}
+    assert {"aggTrade", "bookTicker", "depth@100ms"} <= kinds
+
+
+def test_recorder_stops_if_a_stream_never_arrives(tmp_path):
+    from v3.recorder import L2Recorder, RecorderConfig
+    out = str(tmp_path / "l2")
+
+    async def go():
+        srv = _mock_with_paths(drop_kind="@aggTrade")      # e.g. trades moved to another path
+        runner, host = await srv.start()
+        cfg = RecorderConfig(out=out, symbols=("BTCUSDT",), rest_base=f"http://{host}", ws_base=f"ws://{host}",
+                             duration_s=8.0, health_interval_s=1.0, min_free_gb=0.0, max_gb=None, partial_stream="",
+                             compress=False, stream_check_s=1.5, resync_delay_s=0.1)
+        rec = L2Recorder(cfg)
+        await rec.run()
+        await runner.cleanup()
+        return rec
+
+    rec = asyncio.run(go())
+    assert rec.stop_reason == "stream_never_arrived"
+    stop = [json.loads(x) for x in open(os.path.join(out, "_health", "stops.jsonl"))][-1]
+    assert stop["missing"] == {"BTCUSDT": ["aggTrade"]}

@@ -71,6 +71,11 @@ class RecorderConfig:
     symbols: tuple[str, ...] = DEFAULT_SYMBOLS
     rest_base: str = "https://fapi.binance.com"
     ws_base: str = "wss://fstream.binance.com"
+    # Binance may serve stream families on different paths; None -> ws_base (find with tools.probe_ws)
+    ws_depth_base: str | None = None          # diff depth (+ depth20)
+    ws_bookticker_base: str | None = None
+    ws_trades_base: str | None = None         # aggTrade
+    stream_check_s: float = 120.0             # every stream must have delivered by then, else stop
     diff_stream: str = "depth@100ms"
     partial_stream: str = "depth20@100ms"      # "" to disable
     snapshot_limit: int = 1000
@@ -102,6 +107,8 @@ class SymState:
     d20_mismatch: int = 0
     pending_d20: dict = field(default_factory=dict)
     dropped_seen: int = 0
+    totals: dict = field(default_factory=lambda: defaultdict(int))
+    silent: set = field(default_factory=set)
 
 
 class L2Recorder:
@@ -111,8 +118,19 @@ class L2Recorder:
         self.client = BinanceFuturesClient(ExchangeConfig(rest_base=cfg.rest_base, ws_base=cfg.ws_base))
         self.sym: dict[str, SymState] = {}
         self.system = EventWriter(os.path.join(cfg.out, "_system"))
-        self.conn = StreamConnection("l2", cfg.ws_base, self._on_msg, self._on_connect, self._on_disconnect,
-                                     max_streams=1000)
+        # one connection per distinct base URL; each knows which stream families it carries
+        self.routes = {"depth": cfg.ws_depth_base or cfg.ws_base, "bookTicker": cfg.ws_bookticker_base or cfg.ws_base,
+                       "aggTrade": cfg.ws_trades_base or cfg.ws_base}
+        self.conns: dict[str, StreamConnection] = {}
+        self.conn_kinds: dict[str, set[str]] = {}
+        for fam, base in self.routes.items():
+            if base not in self.conns:
+                name = f"l2-{len(self.conns)}"
+                self.conns[base] = StreamConnection(name, base, self._on_msg, self._on_connect, self._on_disconnect,
+                                                    max_streams=1000)
+                self.conn_kinds[name] = set()
+            self.conn_kinds[self.conns[base].name].add(fam)
+        self.conn = next(iter(self.conns.values()))          # (kept for health compatibility)
         self._stop = asyncio.Event()
         self.stop_reason = ""
         self._last_size: tuple[float, int] | None = None
@@ -159,7 +177,15 @@ class L2Recorder:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=1)
         write_root_meta(self.cfg.out, info)
-        await self.conn.set_streams([x for s in self.cfg.symbols for x in streams[s]])
+        per_conn: dict[str, list[str]] = {b: [] for b in self.conns}
+        for s in self.cfg.symbols:
+            for x in streams[s]:
+                kind = x.partition("@")[2]
+                fam = "depth" if kind.startswith("depth") else kind
+                per_conn[self.routes[fam]].append(x)
+        for base, lst in per_conn.items():
+            await self.conns[base].set_streams(lst)
+        log.info("stream routing: %s", {b: len(v) for b, v in per_conn.items()})
 
     async def run(self) -> None:
         self.store_bytes = store_size(self.cfg.out)
@@ -174,7 +200,8 @@ class L2Recorder:
                 loop.add_signal_handler(sig, self._stop.set)
             except (NotImplementedError, RuntimeError):
                 pass
-        loops = [self.conn.run(), self._audit_loop(), self._time_loop(), self._health_loop(), self._budget_loop()]
+        loops = [c.run() for c in self.conns.values()] + [self._audit_loop(), self._time_loop(), self._health_loop(),
+                                                          self._budget_loop(), self._stream_check()]
         if self.cfg.compress:
             loops.append(self._compact_loop())
         self._tasks = [asyncio.create_task(c) for c in loops]
@@ -189,7 +216,8 @@ class L2Recorder:
 
     async def shutdown(self) -> None:
         log.info("recorder stopping (%s)", self.stop_reason or "requested")
-        await self.conn.stop()
+        for c in self.conns.values():
+            await c.stop()
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -269,16 +297,40 @@ class L2Recorder:
 
     # ------------------------------------------------------------------ messages
     def _on_connect(self, name: str) -> None:
+        if "depth" not in self.conn_kinds.get(name, {"depth"}):
+            log.info("%s connected (%s)", name, sorted(self.conn_kinds[name]))
+            return
         log.info("connected; scheduling snapshots for %d symbols", len(self.sym))
         for s in self.sym:
             self._schedule_resync(s, "connect")
 
     def _on_disconnect(self, name: str) -> None:
         ts = now_ms()
+        kinds = self.conn_kinds.get(name, {"depth"})
         for s, st in self.sym.items():
-            st.writer.write("detail", f"__gap__@{s}", {"reason": "disconnect", "last_u": st.book.last_u}, ts)
-            st.gaps += 1
-            st.book.mark_gap("disconnect")
+            if "depth" in kinds:
+                st.writer.write("detail", f"__gap__@{s}", {"reason": "disconnect", "last_u": st.book.last_u,
+                                                          "streams": sorted(kinds)}, ts)
+                st.gaps += 1
+                st.book.mark_gap("disconnect")
+            else:   # trades / bookTicker outage: the depth book stays valid, but mark the hole
+                st.writer.write("detail", f"__gap__@{s}", {"reason": "stream_disconnect", "streams": sorted(kinds)},
+                                ts)
+
+    def _expected_kinds(self) -> list[str]:
+        k = [self.cfg.diff_stream, "bookTicker", "aggTrade"]
+        return k + ([self.cfg.partial_stream] if self.cfg.partial_stream else [])
+
+    async def _stream_check(self) -> None:
+        """Every stream must have delivered within stream_check_s, or the recording is useless."""
+        await asyncio.sleep(self.cfg.stream_check_s)
+        missing = {s: [k for k in self._expected_kinds() if st.totals[k] == 0] for s, st in self.sym.items()}
+        missing = {s: v for s, v in missing.items() if v}
+        if missing:
+            self._halt("stream_never_arrived", {"missing": missing, "routes": self.routes,
+                                                "hint": "run python -m tools.probe_ws and pass the --ws-*-base flags"})
+        else:
+            log.info("all streams delivering for all symbols (%s)", self._expected_kinds())
 
     def _on_msg(self, stream: str, data: Any, ts: int) -> None:
         sym_lower, _, kind = stream.partition("@")
@@ -288,6 +340,7 @@ class L2Recorder:
             return
         st.writer.write("detail", stream, data, ts)
         st.counts[kind] += 1
+        st.totals[kind] += 1
         if isinstance(data, dict) and isinstance(data.get("E"), int):
             lat = st.lat[kind]
             if len(lat) < 20_000:
@@ -418,7 +471,8 @@ class L2Recorder:
         rec: dict[str, Any] = {"ts": ts, "final": final, "free_gb": round(free_gb, 2),
                                "store_gb": round(self.store_bytes / 1e9, 3), "max_gb": self.cfg.max_gb,
                                "stop_reason": self.stop_reason or None,
-                               "connected": self.conn.connected.is_set(), "reconnects": self.conn.n_reconnects,
+                               "connected": all(c.connected.is_set() for c in self.conns.values()),
+                               "reconnects": sum(c.n_reconnects for c in self.conns.values()),
                                "symbols": {}}
         for s, st in self.sym.items():
             lat = {}
@@ -432,6 +486,13 @@ class L2Recorder:
                                  "d20_checked": st.d20_checked, "d20_mismatch": st.d20_mismatch,
                                  "writer_dropped": st.writer.dropped, "writer_written": st.writer.n_written,
                                  "levels": [len(st.book.bids), len(st.book.asks)]}
+            silent = [k for k in self._expected_kinds() if st.counts.get(k, 0) == 0]
+            rec["symbols"][s]["silent_streams"] = silent
+            for k in silent:
+                if k not in st.silent and not final:      # once per silent episode
+                    log.error("%s %s delivered nothing in the last %.0f s", s, k, self.cfg.health_interval_s)
+                    st.writer.write("detail", f"__gap__@{s}", {"reason": "stream_silent", "stream": k}, ts)
+            st.silent = set(silent)
             st.counts = defaultdict(int)
             st.lat = defaultdict(list)
         d = os.path.join(self.cfg.out, "_health")
@@ -440,8 +501,9 @@ class L2Recorder:
                   encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
         bad = [s for s, v in rec["symbols"].items() if not v["book_valid"]]
-        log.info("health: free=%.1fGB reconnects=%d invalid_books=%s gaps=%s", free_gb, self.conn.n_reconnects, bad,
-                 {s: v["gaps"] for s, v in rec["symbols"].items()})
+        log.info("health: free=%.1fGB reconnects=%d invalid_books=%s gaps=%s silent=%s", free_gb, rec["reconnects"],
+                 bad, {s: v["gaps"] for s, v in rec["symbols"].items()},
+                 {s: v["silent_streams"] for s, v in rec["symbols"].items() if v["silent_streams"]})
         if not final:
             self._check_budget()
 
@@ -481,6 +543,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--days", type=float, help="stop after this many days (default: run until stopped)")
     ap.add_argument("--rest-base", default=RecorderConfig.rest_base)
     ap.add_argument("--ws-base", default=RecorderConfig.ws_base)
+    ap.add_argument("--ws-depth-base", help="base URL for diff depth (default --ws-base); see tools.probe_ws")
+    ap.add_argument("--ws-bookticker-base", help="base URL for bookTicker (default --ws-base)")
+    ap.add_argument("--ws-trades-base", help="base URL for aggTrade (default --ws-base)")
     ap.add_argument("--no-depth20", action="store_true")
     ap.add_argument("--audit-interval-s", type=float, default=600.0)
     ap.add_argument("--min-free-gb", type=float, default=5.0, help="stop if the drive's free space falls below this")
@@ -493,7 +558,8 @@ def main(argv: list[str] | None = None) -> None:
     a = ap.parse_args(argv)
     logging.basicConfig(level=a.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = RecorderConfig(out=a.out, symbols=tuple(s.upper() for s in a.symbols), rest_base=a.rest_base,
-                         ws_base=a.ws_base, partial_stream="" if a.no_depth20 else RecorderConfig.partial_stream,
+                         ws_base=a.ws_base, ws_depth_base=a.ws_depth_base, ws_bookticker_base=a.ws_bookticker_base,
+                         ws_trades_base=a.ws_trades_base, partial_stream="" if a.no_depth20 else RecorderConfig.partial_stream,
                          audit_interval_s=a.audit_interval_s, min_free_gb=a.min_free_gb,
                          max_gb=a.max_gb or None, compress=not a.no_compress, zstd_level=a.zstd_level,
                          duration_s=a.days * 86400 if a.days else None)
