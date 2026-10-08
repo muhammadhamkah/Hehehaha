@@ -18,9 +18,9 @@ is blocked (HTTP 451 / 403), so recording has to run on your own machine or a VP
 
 - **Machine:** 1–2 vCPU and 2 GB RAM are enough. Use a stable connection, NTP-synced time, and a
   region close to Binance's matching engine (Tokyo or Singapore is typical).
-- **Disk:** about 4–6 GB/day for the 5 symbols with depth20 enabled (gzip JSONL), so 14 days ≈
-  80 GB and 30 days ≈ 170 GB. `--no-depth20` saves about 30%, but you lose the independent
-  cross-check of the diff book.
+- **Disk:** see §3a. For a machine with about 130 GB in total, give the recorder **`--max-gb 95`**
+  (90–100 GB at most). Keep the remaining 30–35 GB for the OS, temporary files, dataset building
+  and research outputs (at least 20–30 GB must stay free).
 - **No API key is needed.** The recorder uses public streams only and has no order code path.
 
 ## 2. Check connectivity first
@@ -32,22 +32,85 @@ python -m tools.validate_binance --symbols 5 --duration 60 --out validation_repo
 Every check should PASS, especially `diff_depth_sync`. If Binance has changed its websocket base
 URL or stream paths, pass the new ones to the recorder with `--ws-base` / `--rest-base`.
 
-## 3. Record
-
-Start with the three most liquid contracts, then add DOGE and LINK after a day of clean QA:
+## 3. Record — recommended initial run (130 GB machine)
 
 ```bash
-python -m v3.recorder --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT
-# after QA looks clean (restarting appends to the same store):
-python -m v3.recorder --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT DOGEUSDT LINKUSDT
+python -m v3.recorder --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT \
+    --no-depth20 --max-gb 95 --min-free-gb 10 --days 14
 ```
 
-For unattended operation use `deploy/v3-recorder.service` (systemd) or `deploy/Dockerfile.recorder`.
+- **Symbols and duration:** BTCUSDT, ETHUSDT and SOLUSDT only, with a 14-day target.
+- **`--no-depth20`** drops only the redundant top-20 snapshot stream. The full book is rebuilt from
+  the diff stream, and the sequence checks and gap handling are unchanged.
+- **Compression:** finished hours are recompressed to zstd automatically (level 19, lossless,
+  verified before the original is deleted).
+- **Budgets:** the recorder stops cleanly before 95 GB, or when the drive has less than 10 GB
+  free.
 
-**What is recorded, per symbol (`/data/l2/<SYMBOL>/<YYYYMMDD>/<HH>.jsonl.gz`):**
+For unattended operation, `deploy/v3-recorder.service` (systemd) and `deploy/Dockerfile.recorder`
+already contain these flags.
+
+### 3a. Storage: what is kept and what is saved
+
+| Kept (never removed or thinned) | Saved |
+|---|---|
+| Diff-depth updates (`depth@100ms`) with U/u/pu update ids | `depth20@100ms` not recorded (`--no-depth20`), about 30% of raw bytes |
+| REST snapshots for sync (`__snapshot__`) and audit snapshots | Closed hours recompressed gzip → zstd 19, about 2× smaller on real Binance JSON |
+| `bookTicker`, `aggTrade` |  |
+| Exchange timestamps (E/T), local receive timestamps |  |
+| Gap / resync markers |  |
+
+**Compression is lossless and safe:**
+
+- A file is recompressed only after its hour has ended (plus a 3-minute grace period) **and** no
+  writer still holds it.
+- The `.zst` file is decompressed again and checked against the original content (SHA-256 and
+  line count). Only then is the original removed.
+- Original size, compressed size and ratio go to `_health/compaction.jsonl`.
+- Readers handle `.gz`, `.zst` and `.xz` transparently.
+- `python -m v3.compact --store /data/l2` does the same by hand, for example for hours left
+  open by a restart.
+
+**Hard budget (`--max-gb`):**
+
+- The whole store size is checked every 15 s.
+- The recorder stops *before* reaching the budget, keeping a margin of at least 0.5 GB or five
+  minutes of current growth, whichever is larger.
+- Already-written data is untouched, and the reason is written to `_health/stops.jsonl`, the
+  health log and `_system` (`__stop__`).
+- If the store is already over budget, the recorder refuses to start and exits with status 3.
+  The systemd unit does not restart on that status.
+- `--min-free-gb` stays on as a second safeguard for the drive itself.
+
+### 3b. After the first 1–3 hours: measured storage projection
+
+```bash
+python -m v3.storage --store /data/l2 --max-gb 95 --hours 3 --days 14 21
+```
+
+This uses actual recorded bytes (an hour still in gzip is measured by compressing it at the
+recorder's zstd level). It reports:
+
+- compressed and raw MB/hour per symbol;
+- compressed MB/hour per stream type;
+- projected GB/day;
+- projected GB for 14 and 21 days;
+- the store size now and the headroom under `--max-gb`.
+
+It also writes `<store>/storage_projection.json`. It needs at least one hour of data per symbol
+and refuses to guess with less.
+
+**Decision rule:**
+
+- If 14 days fits with a 10% margin, keep recording.
+- If it does **not** fit, stop and look at the projection before changing anything. Never reduce
+  or thin the core diff-depth feed to make it fit. The acceptable options are a shorter duration,
+  fewer symbols, or a larger disk.
+
+**What is recorded, per symbol (`/data/l2/<SYMBOL>/<YYYYMMDD>/<HH>.jsonl.gz`, `.jsonl.zst` once the hour is closed):**
 
 - **Streams:** `depth@100ms` diff depth (U/u/pu update ids; 100 ms is the fastest USDT-M diff
-  interval), `depth20@100ms` (levels 1–20), `bookTicker`, `aggTrade`.
+  interval), `bookTicker`, `aggTrade`; plus `depth20@100ms` (levels 1–20) unless `--no-depth20`.
 - **Timestamps:** local receive time on every line; exchange `E`/`T` timestamps inside the payloads.
 - **Snapshots:**
   - `__snapshot__`: the REST snapshot (`limit=1000`) used for every (re)synchronisation.
@@ -56,7 +119,7 @@ For unattended operation use `deploy/v3-recorder.service` (systemd) or `deploy/D
   - `__gap__`: a continuity break, with its reason (`pu_mismatch`, `snapshot_not_bridged`,
     `crossed`, `disconnect`, `writer_drop`) and update ids.
   - `__resync__`: the result of the rebuild.
-  - `__check__`: the diff book disagreed with depth20.
+  - `__check__`: the diff book disagreed with depth20 (only when depth20 is recorded).
 - **Store files:** `_system/` (server-time samples), `_health/` (per-minute health),
   `v3_store.json` (manifest), `meta.json` (symbol filters).
 
@@ -82,7 +145,7 @@ nothing, and no resync failed. `--deep` re-validates every diff offline and repo
 
 - gaps by reason;
 - the share of time the book was valid;
-- agreement between the diff book and depth20 (should be ≈ 1.0);
+- agreement between the diff book and depth20 (≈ 1.0; only when depth20 is recorded);
 - the longest silence per stream.
 
 Copy the store to the research machine with `rsync -a /data/l2/ research:/data/l2/`. Files are
@@ -91,6 +154,7 @@ append-only.
 ## 5. Plan the split before looking at results
 
 - **Minimum:** 7 full days. **Preferred:** 14–30.
+- Example for 14 days: TRAIN days 1–8, CALIBRATION day 9, SELECTION days 10–11, TEST days 12–14.
 - Example for 21 days: TRAIN days 1–12, CALIBRATION days 13–14, SELECTION days 15–17, TEST days 18–21.
 - Write the split down **before** building the dataset. The test days are never passed to
   `v3.research`; it refuses them through `--forbid-days`.
@@ -98,10 +162,33 @@ append-only.
 ## 6. Build the dataset
 
 ```bash
-python -m v3.dataset --store /data/l2 --out data/v3/ds --days 2025-01-06 ... 2025-01-26 --workers 4
+python -m v3.dataset --store /data/l2 --out data/v3/ds --days 2025-01-06 ... --sample-ms 2000 --workers 4
 ```
 
-**Each row (1 s sampling, 250 ms evaluation grid) contains:**
+`--sample-ms` only sets the spacing of the generated training rows. The raw L2 stream and the
+features are computed at full recorded fidelity either way: every message is processed, features
+are evaluated on a 250 ms grid, and labels use every bookTicker update.
+
+| | 1000 ms rows | 2000 ms rows |
+|---|---|---|
+| Rows per symbol per day | 86,400 | 43,200 |
+| Dataset disk (parquet, ~800 columns) | ≈ 0.3–0.5 GB / symbol-day | ≈ 0.15–0.25 GB / symbol-day |
+| RAM / model fitting time | 1× | ≈ 0.5× |
+| Information | adjacent rows overlap heavily: features share 1–10 s windows and labels share 5–120 s paths | almost the same; still dozens of rows per 60 s label horizon |
+| Effective independent samples | dominated by the number of distinct minutes and regimes, not row count | about the same |
+| When to choose | if disk and RAM allow | **recommended on the 130 GB machine** |
+
+Build time is the same for both, because the full stream is processed either way.
+
+`dataset_manifest.json` records, per (symbol, day):
+
+- rows and expected rows;
+- the parquet SHA-256;
+- the feature schema version and column hash;
+- the label configuration;
+- sample/eval spacing, window and latency.
+
+**Each row (250 ms evaluation grid, spaced by `--sample-ms`) contains:**
 
 - **V2 features**, computed from an L1-only view of the same recording (exactly V2's definition;
   used for Stage A and the L1 baseline).
@@ -137,6 +224,34 @@ warm-up after a resync), or when the label path crosses a disconnect.
 - **Absorption (bullish):** aggressive selling over 3 s ÷ bid depth5 × [best bid held] ×
   bid replenishment ratio. "Bearish" is the mirror image.
 
+## 6a. Optional: delete raw TRAINING days to reclaim space (never automatic)
+
+```bash
+python -m v3.qa --store /data/l2 --deep                       # writes /data/l2/QA.json
+python -m v3.cleanup_training_raw --store /data/l2 --dataset data/v3/ds --split split.json   # dry run
+python -m v3.cleanup_training_raw ... --delete --confirm DELETE-TRAINING-RAW
+```
+
+`split.json` is the split you fixed in §5:
+`{"train": [...], "calibration": [...], "selection": [...], "test": [...]}`.
+
+A training day's raw files are deleted only if **every** symbol that day passes all of these:
+
+- the dataset shard exists and its SHA-256 matches the manifest;
+- the row count is valid and at least 50% of expected;
+- the feature schema version, column hash and label configuration are recorded;
+- deep QA passed (book valid ≥ 95% of the day; health marked the day usable);
+- symbol/date coverage is complete.
+
+Other rules:
+
+- It prints every file it would delete.
+- Validation and test raw data are **never** deleted, because the execution replay needs them.
+  Nor is hour 23 of the day before a protected day, which is warm-up data.
+- Deletions are logged to `_health/cleanup.jsonl`.
+- Do this only if space is actually short. Raw training days are what allow rebuilding the
+  dataset if a feature definition changes later.
+
 ## 7. Research (train / calibration / selection only)
 
 ```bash
@@ -169,7 +284,7 @@ lifetime. Any gain attributed to L2 therefore comes from depth beyond the touch.
 
 ```bash
 python -m v3.evaluate --store /data/l2 --out runs/v3_replay --models models/v3 --kinds v3_all v3_l1 \
-    --symbols BTCUSDT ETHUSDT SOLUSDT DOGEUSDT LINKUSDT --val-days <15 16 17> --test-days <18 19 20 21> \
+    --symbols BTCUSDT ETHUSDT SOLUSDT --val-days <15 16 17> --test-days <18 19 20 21> \
     --latencies 50 100 250
 # then, exactly once, with the frozen configs:
 python -m v3.evaluate ... --final-test

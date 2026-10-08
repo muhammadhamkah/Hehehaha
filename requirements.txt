@@ -9,3 +9,5 @@ lightgbm>=4.0
 xgboost>=2.0
 scikit-learn>=1.3
 pyarrow>=14
+# V3 recorder: lossless zstd recompression of closed hourly files
+zstandard>=0.22

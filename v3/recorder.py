@@ -1,6 +1,6 @@
 """V3 standalone L2 recorder for Binance USDT-M perpetuals (public market data only).
 
-    python -m v3.recorder --out data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT [--days 14]
+    python -m v3.recorder --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT --no-depth20 --max-gb 95 [--days 14]
 
 Must run on a machine where Binance USDT-M market data is reachable and permitted. It
 never places orders and needs no API key.
@@ -22,6 +22,15 @@ Also written: ``<out>/v3_store.json`` (manifest), ``<out>/_system`` (server-time
 ``<out>/_health/YYYYMMDD.jsonl`` (per-minute health: message rates, gaps, resyncs, depth20
 mismatches, latency percentiles, writer drops, disk space). ``python -m v3.qa`` turns these
 into a recording-quality report.
+
+Storage (lossless only): each hourly file is written as gzip while open; once the hour is
+closed (and no writer holds it) it is recompressed to zstd in the background, verified by a
+full decompress + SHA-256 comparison, and only then is the gzip original removed
+(``v3.compact``; sizes and ratios logged to ``_health/compaction.jsonl``). The recorder
+watches the whole store size and stops cleanly BEFORE ``--max-gb`` would be exceeded, and
+also when the drive's free space drops below ``--min-free-gb``; the stop reason is written
+to ``_health/stops.jsonl``, the health log and ``_system`` (``__stop__``). Nothing already
+written is touched.
 
 Continuity is validated live with the same rules the dataset builder and the replay use;
 on any break the gap is marked and the book is rebuilt from a fresh REST snapshot -- the
@@ -70,6 +79,12 @@ class RecorderConfig:
     health_interval_s: float = 60.0
     resync_delay_s: float = 0.5               # let diffs buffer before the snapshot request
     min_free_gb: float = 5.0
+    max_gb: float | None = 95.0               # hard budget for the whole store (None = no budget)
+    budget_margin_gb: float = 0.5             # stop at least this far below the budget
+    budget_check_s: float = 15.0
+    compress: bool = True                     # recompress closed hours to zstd (lossless, verified)
+    zstd_level: int = 19
+    compact_interval_s: float = 120.0
     duration_s: float | None = None
 
 
@@ -99,6 +114,9 @@ class L2Recorder:
         self.conn = StreamConnection("l2", cfg.ws_base, self._on_msg, self._on_connect, self._on_disconnect,
                                      max_streams=1000)
         self._stop = asyncio.Event()
+        self.stop_reason = ""
+        self._last_size: tuple[float, int] | None = None
+        self.store_bytes = 0
         self._tasks: list[asyncio.Task] = []
         self.started_ms = now_ms()
 
@@ -144,6 +162,11 @@ class L2Recorder:
         await self.conn.set_streams([x for s in self.cfg.symbols for x in streams[s]])
 
     async def run(self) -> None:
+        self.store_bytes = store_size(self.cfg.out)
+        if self.cfg.max_gb is not None and self.store_bytes / 1e9 >= self.cfg.max_gb - self.cfg.budget_margin_gb:
+            log.critical("store already uses %.2f GB of the %s GB budget; not starting "
+                         "(raise --max-gb or free space first)", self.store_bytes / 1e9, self.cfg.max_gb)
+            raise SystemExit(EXIT_BUDGET)
         await self.start()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -151,8 +174,10 @@ class L2Recorder:
                 loop.add_signal_handler(sig, self._stop.set)
             except (NotImplementedError, RuntimeError):
                 pass
-        self._tasks = [asyncio.create_task(c) for c in (self.conn.run(), self._audit_loop(), self._time_loop(),
-                                                         self._health_loop())]
+        loops = [self.conn.run(), self._audit_loop(), self._time_loop(), self._health_loop(), self._budget_loop()]
+        if self.cfg.compress:
+            loops.append(self._compact_loop())
+        self._tasks = [asyncio.create_task(c) for c in loops]
         try:
             if self.cfg.duration_s:
                 await asyncio.wait_for(self._stop.wait(), self.cfg.duration_s)
@@ -163,7 +188,7 @@ class L2Recorder:
         await self.shutdown()
 
     async def shutdown(self) -> None:
-        log.info("recorder stopping")
+        log.info("recorder stopping (%s)", self.stop_reason or "requested")
         await self.conn.stop()
         for t in self._tasks:
             t.cancel()
@@ -174,8 +199,62 @@ class L2Recorder:
         self.system.close()
         await self.client.close()
 
-    def request_stop(self) -> None:
+    def request_stop(self, reason: str = "requested") -> None:
+        self._halt(reason, {})
+
+    def _halt(self, reason: str, detail: dict) -> None:
+        """Stop cleanly and record why (health log, system events, stops.jsonl)."""
+        if self._stop.is_set():
+            return
+        self.stop_reason = reason
+        ts = now_ms()
+        rec = {"ts": ts, "reason": reason, **detail}
+        log.critical("STOPPING RECORDER: %s %s", reason, detail)
+        self.system.write("detail", "__stop__@ALL", rec, ts)
+        d = os.path.join(self.cfg.out, "_health")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "stops.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
         self._stop.set()
+
+    # ------------------------------------------------------------------ storage
+    def _open_paths(self) -> set[str]:
+        return {w.current_path for w in [self.system] + [st.writer for st in self.sym.values()] if w.current_path}
+
+    async def _compact_loop(self) -> None:
+        from v3.compact import compact_store
+
+        while True:
+            await asyncio.sleep(self.cfg.compact_interval_s)
+            try:
+                await asyncio.to_thread(compact_store, self.cfg.out, self._open_paths(), self.cfg.zstd_level)
+            except Exception as exc:  # noqa: BLE001
+                log.error("compaction pass failed (originals kept): %s", exc)
+
+    async def _budget_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.cfg.budget_check_s)
+            self._check_budget()
+
+    def _check_budget(self) -> None:
+        size = store_size(self.cfg.out)
+        t = time.time()
+        rate = 0.0
+        if self._last_size is not None and t > self._last_size[0]:
+            rate = max(size - self._last_size[1], 0) / (t - self._last_size[0])
+        self._last_size = (t, size)
+        self.store_bytes = size
+        if self.cfg.max_gb is not None:
+            # stop BEFORE the budget: keep a margin of several check intervals of growth
+            margin = max(self.cfg.budget_margin_gb * 1e9, rate * max(self.cfg.budget_check_s, 60.0) * 5)
+            if size + margin >= self.cfg.max_gb * 1e9:
+                self._halt("max_gb_budget", {"store_gb": round(size / 1e9, 3), "max_gb": self.cfg.max_gb,
+                                             "margin_gb": round(margin / 1e9, 3),
+                                             "growth_mb_per_min": round(rate * 60 / 1e6, 2)})
+                return
+        free_gb = shutil.disk_usage(self.cfg.out).free / 1e9
+        if free_gb < self.cfg.min_free_gb:
+            self._halt("min_free_gb", {"free_gb": round(free_gb, 2), "min_free_gb": self.cfg.min_free_gb})
 
     # ------------------------------------------------------------------ messages
     def _on_connect(self, name: str) -> None:
@@ -318,6 +397,8 @@ class L2Recorder:
         ts = now_ms()
         free_gb = shutil.disk_usage(self.cfg.out).free / 1e9
         rec: dict[str, Any] = {"ts": ts, "final": final, "free_gb": round(free_gb, 2),
+                               "store_gb": round(self.store_bytes / 1e9, 3), "max_gb": self.cfg.max_gb,
+                               "stop_reason": self.stop_reason or None,
                                "connected": self.conn.connected.is_set(), "reconnects": self.conn.n_reconnects,
                                "symbols": {}}
         for s, st in self.sym.items():
@@ -342,9 +423,22 @@ class L2Recorder:
         bad = [s for s, v in rec["symbols"].items() if not v["book_valid"]]
         log.info("health: free=%.1fGB reconnects=%d invalid_books=%s gaps=%s", free_gb, self.conn.n_reconnects, bad,
                  {s: v["gaps"] for s, v in rec["symbols"].items()})
-        if free_gb < self.cfg.min_free_gb and not final:
-            log.critical("free disk %.1f GB below %.1f GB; stopping the recorder", free_gb, self.cfg.min_free_gb)
-            self._stop.set()
+        if not final:
+            self._check_budget()
+
+
+EXIT_BUDGET = 3          # exit status when refusing to start over budget (systemd: RestartPreventExitStatus=3)
+
+
+def store_size(root: str) -> int:
+    total = 0
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total
 
 
 def write_root_meta(root: str, symbol_info: dict) -> None:
@@ -370,13 +464,19 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--ws-base", default=RecorderConfig.ws_base)
     ap.add_argument("--no-depth20", action="store_true")
     ap.add_argument("--audit-interval-s", type=float, default=600.0)
-    ap.add_argument("--min-free-gb", type=float, default=5.0)
+    ap.add_argument("--min-free-gb", type=float, default=5.0, help="stop if the drive's free space falls below this")
+    ap.add_argument("--max-gb", type=float, default=95.0,
+                    help="hard budget for the whole store; the recorder stops cleanly before exceeding it "
+                         "(default 95; use 0 to disable)")
+    ap.add_argument("--no-compress", action="store_true", help="keep closed hours as gzip (no zstd recompression)")
+    ap.add_argument("--zstd-level", type=int, default=19)
     ap.add_argument("--log-level", default="INFO")
     a = ap.parse_args(argv)
     logging.basicConfig(level=a.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = RecorderConfig(out=a.out, symbols=tuple(s.upper() for s in a.symbols), rest_base=a.rest_base,
                          ws_base=a.ws_base, partial_stream="" if a.no_depth20 else RecorderConfig.partial_stream,
                          audit_interval_s=a.audit_interval_s, min_free_gb=a.min_free_gb,
+                         max_gb=a.max_gb or None, compress=not a.no_compress, zstd_level=a.zstd_level,
                          duration_s=a.days * 86400 if a.days else None)
     asyncio.run(L2Recorder(cfg).run())
 

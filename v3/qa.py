@@ -138,6 +138,17 @@ def main() -> None:
         L += ["## Recorder health (per day, per symbol)\n", hs.to_string(index=False), ""]
         usable = hs[hs["usable"]].groupby("day")["symbol"].apply(list)
         L += ["## Usable days\n", usable.to_string() if len(usable) else "_none yet_", ""]
+    for name, title in (("stops.jsonl", "Recorder stops (reason)"), ("compaction.jsonl", "zstd recompression")):
+        path = os.path.join(a.store, "_health", name)
+        if os.path.exists(path):
+            recs = [json.loads(x) for x in open(path, encoding="utf-8") if x.strip()]
+            if name == "compaction.jsonl" and recs:
+                o = sum(r["orig_bytes"] for r in recs)
+                z = sum(r["zst_bytes"] for r in recs)
+                L += [f"## {title}\n", f"{len(recs)} hourly files: {o / 1e9:.2f} GB gzip -> {z / 1e9:.2f} GB zstd "
+                      f"(ratio {o / z:.2f}); every file verified (SHA-256) before the original was removed", ""]
+            elif recs:
+                L += [f"## {title}\n", "\n".join(json.dumps(r) for r in recs[-10:]), ""]
     deep = []
     if a.deep:
         for s in store_symbols(a.store):

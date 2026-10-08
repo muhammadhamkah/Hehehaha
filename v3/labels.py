@@ -34,6 +34,10 @@ PAIR_HORIZON_MS = 120_000
 FRET_S = (1, 5, 10, 30, 60)
 BUCKET_MS = 100
 INF = np.iinfo(np.int64).max
+LABEL_CONFIG = {"version": "v3-labels-1", "xs_bps": list(XS), "horizons_s": list(HORIZONS_S),
+                "pairs_tp_sl_bps": [list(p) for p in PAIRS], "horizon_ms": HORIZON_MS,
+                "pair_horizon_ms": PAIR_HORIZON_MS, "fret_s": list(FRET_S), "bucket_ms": BUCKET_MS,
+                "prices": "executable (long buys ask / exits bid; short sells bid / exits ask) after entry latency"}
 
 
 def bucketize(q_ts: np.ndarray, q_bid: np.ndarray, q_ask: np.ndarray, t0: int, t1: int):

@@ -331,3 +331,136 @@ def test_v3_refused_live():
     c.mode = "live"
     c.strategy.predictor = "v3"
     assert any("V3" in p for p in c.validate())
+
+
+# ---------------------------------------------------------------------- storage saving
+def _events_digest(root):
+    import hashlib
+    from data.event_store import open_reader
+    h, n = hashlib.sha256(), 0
+    for ev in open_reader(root):
+        h.update(json.dumps([ev.ts, ev.local_ts, ev.stream, ev.data], sort_keys=True).encode())
+        n += 1
+    return n, h.hexdigest()
+
+
+def test_zstd_compaction_is_lossless_and_skips_open_files(syn, tmp_path):
+    import shutil
+    from data.event_store import list_event_files
+    from v3.compact import compact_store
+
+    _, store = syn
+    cp = str(tmp_path / "store")
+    shutil.copytree(store, cp)
+    before = _events_digest(cp)
+    gz = sorted(list_event_files(os.path.join(cp, "SYNAUSDT")))
+    keep_open = gz[-1]                                   # pretend a writer still holds this file
+    recs = compact_store(cp, open_paths={keep_open}, level=3)
+    assert recs and all(r["zst_bytes"] < r["orig_bytes"] for r in recs)
+    assert os.path.exists(keep_open)                     # never compress a file being written
+    files = list_event_files(os.path.join(cp, "SYNAUSDT"))
+    assert any(f.endswith(".zst") for f in files) and keep_open in files
+    assert _events_digest(cp) == before                  # readers see exactly the same events
+    log = [json.loads(x) for x in open(os.path.join(cp, "_health", "compaction.jsonl"))]
+    assert {"orig_bytes", "zst_bytes", "ratio", "sha256"} <= set(log[0])
+    # a not-yet-closed hour (grace period) is left alone
+    assert compact_store(cp, level=3, now_ms=0) == []
+
+
+def test_recorder_budget_stops_cleanly_and_refuses_overbudget_start(tmp_path):
+    from tests.mock_binance import MockBinanceServer
+    from v3.recorder import EXIT_BUDGET, L2Recorder, RecorderConfig
+
+    out = str(tmp_path / "l2")
+
+    async def go(max_gb, margin):
+        srv = MockBinanceServer()
+        runner, host = await srv.start()
+        cfg = RecorderConfig(out=out, symbols=("BTCUSDT",), rest_base=f"http://{host}", ws_base=f"ws://{host}",
+                             duration_s=8.0, health_interval_s=5.0, budget_check_s=0.3, min_free_gb=0.0,
+                             max_gb=max_gb, budget_margin_gb=margin, partial_stream="", compress=False)
+        rec = L2Recorder(cfg)
+        try:
+            await rec.run()
+        finally:
+            await runner.cleanup()
+        return rec
+
+    rec = asyncio.run(go(20_000 / 1e9, 1e-9))            # ~20 kB budget: must stop long before 8 s
+    assert rec.stop_reason == "max_gb_budget"
+    stops = [json.loads(x) for x in open(os.path.join(out, "_health", "stops.jsonl"))]
+    assert stops[-1]["reason"] == "max_gb_budget" and stops[-1]["max_gb"] == 20_000 / 1e9
+    from v3.recorder import store_size
+    assert store_size(out) < 20_000 + 200_000              # stopped near the budget; data preserved
+    n, _ = _events_digest(os.path.join(out, "BTCUSDT"))
+    assert n > 0
+    with pytest.raises(SystemExit) as e:                    # already over budget -> refuse to start
+        asyncio.run(go(1e-9, 1e-9))
+    assert e.value.code == EXIT_BUDGET
+
+
+def test_storage_projection_uses_actual_bytes(syn):
+    from v3.storage import project
+    _, store = syn
+    assert "error" in project(store, 95.0, hours=10, level=3)        # < 1 h recorded: refuses to guess
+    rep = project(store, 95.0, hours=10, days=(14, 21), level=3, min_seconds=600)
+    assert "error" not in rep, rep
+    s = rep["symbols"]["SYNAUSDT"]
+    assert s["seconds_measured"] >= 600 and s["compressed_mb_per_hour"] > 0 and s["raw_mb_per_hour"] > 0
+    assert rep["projections"]["14_days"]["projected_gb"] == pytest.approx(rep["projected_gb_per_day"] * 14, rel=1e-3)
+    assert {"depth@100ms", "aggTrade", "bookTicker"} <= set(rep["per_stream_compressed_mb_per_hour"])
+    assert rep["projections"]["14_days"]["fits_with_10pct_margin"] is True
+
+
+def test_cleanup_training_raw_guards(built, tmp_path):
+    import shutil
+    from v3 import cleanup_training_raw as C
+    from v3.dataset import update_manifest
+    from v3.qa import deep_check
+
+    root, store, ds, days = built
+    st, dd = str(tmp_path / "store"), str(tmp_path / "ds")
+    shutil.copytree(store, st)
+    shutil.copytree(ds, dd)
+    # manifest as v3.dataset main() writes it (the fixture called build_shard directly)
+    import glob as _g
+    from v3.dataset import build_shard
+    entries = []
+    for d in days[:2]:
+        for s in ("SYNAUSDT", "SYNBUSDT"):
+            entries.append(build_shard((st, dd, s, d, (0, 1), 1000, 250, 100)))
+    update_manifest(dd, entries)
+    qa = {"deep": deep_check(st, "SYNAUSDT") + deep_check(st, "SYNBUSDT"), "health": []}
+    json.dump(qa, open(os.path.join(st, "QA.json"), "w"))
+    split = str(tmp_path / "split.json")
+    json.dump({"train": days[:2], "calibration": [days[2]], "selection": [], "test": [days[3]]}, open(split, "w"))
+    p = C.plan(st, dd, split, os.path.join(st, "QA.json"), None, 0.3)
+    deleted_days = {x["day"] for x in p["delete"]}
+    assert deleted_days <= set(days[:2])                                     # never validation/test
+    assert all(days[2].replace("-", "") not in x["file"] and days[3].replace("-", "") not in x["file"]
+               for x in p["delete"])
+    assert p["delete"] or p["kept_days"]
+    # a tampered dataset file keeps the day
+    victim = os.path.join(dd, f"SYNAUSDT_{days[0]}.parquet")
+    with open(victim, "ab") as fh:
+        fh.write(b"x")
+    p2 = C.plan(st, dd, split, os.path.join(st, "QA.json"), [days[0]], 0.3)
+    assert not p2["delete"] and "checksum" in json.dumps(p2["kept_days"])
+    # asking for a protected day is refused
+    p3 = C.plan(st, dd, split, os.path.join(st, "QA.json"), [days[3]], 0.3)
+    assert p3["refused_not_training"] == [days[3]] and not p3["delete"]
+    # overlapping split is rejected
+    json.dump({"train": days[:3], "calibration": [days[2]], "test": [days[3]]}, open(split, "w"))
+    with pytest.raises(SystemExit):
+        C.load_split(split)
+    # dry run by default: nothing removed
+    json.dump({"train": days[:2], "calibration": [days[2]], "test": [days[3]]}, open(split, "w"))
+    import sys
+    before = sorted(_g.glob(os.path.join(st, "*", "*", "*")))
+    argv = sys.argv
+    sys.argv = ["x", "--store", st, "--dataset", dd, "--split", split, "--min-row-fraction", "0.3"]
+    try:
+        C.main()
+    finally:
+        sys.argv = argv
+    assert sorted(_g.glob(os.path.join(st, "*", "*", "*"))) == before

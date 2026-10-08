@@ -21,6 +21,7 @@ for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     _os.environ.setdefault(_var, "1")
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -34,7 +35,8 @@ import pandas as pd
 
 from config import BotConfig
 from data.event_store import load_meta
-from v3.labels import PAIR_HORIZON_MS, labels
+from v3.features import FEATURE_VERSION
+from v3.labels import LABEL_CONFIG, PAIR_HORIZON_MS, labels
 from v3.state import SymbolState
 from v3.store import V3StoreReader
 
@@ -104,11 +106,41 @@ def build_shard(args: tuple) -> dict:
     df.insert(0, "symbol", symbol)
     df.insert(1, "day", day)
     os.makedirs(os.path.join(out, "timeline"), exist_ok=True)
-    df.astype({c: "float32" for c in df.columns if df[c].dtype == np.float64}).to_parquet(
-        os.path.join(out, f"{symbol}_{day}.parquet"), index=False)
+    path = os.path.join(out, f"{symbol}_{day}.parquet")
+    df.astype({c: "float32" for c in df.columns if df[c].dtype == np.float64}).to_parquet(path, index=False)
+    feats = [c for c in df.columns if c.startswith(("v3d_", "v3f_", "v3t_", "v3x_"))]
+    stats.update({"file": os.path.basename(path), "sha256": sha256_file(path), "feature_version": FEATURE_VERSION,
+                  "n_columns": len(df.columns), "n_v3_features": len(feats),
+                  "columns_sha256": hashlib.sha256("\n".join(df.columns).encode()).hexdigest(),
+                  "label_config": LABEL_CONFIG, "sample_ms": sample_ms, "eval_ms": eval_ms, "window_utc_h": list(window),
+                  "latency_ms": latency_ms, "expected_rows": int((window[1] - window[0]) * 3_600_000 // sample_ms),
+                  "store": os.path.abspath(store), "built_at_ms": int(time.time() * 1000)})
     if st.timeline:
         pd.DataFrame(st.timeline).to_parquet(os.path.join(out, "timeline", f"{symbol}_{day}.parquet"), index=False)
     return stats
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def update_manifest(out: str, entries: list[dict]) -> None:
+    """dataset_manifest.json: one entry per (symbol, day) shard, latest build wins."""
+    path = os.path.join(out, "dataset_manifest.json")
+    man = {"format": "v3_dataset", "shards": {}}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            man = json.load(fh)
+    for e in entries:
+        man["shards"][f"{e['symbol']}_{e['day']}"] = e
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(man, fh, indent=1)
+    os.replace(tmp, path)
 
 
 def load(path: str, days: list[str] | None = None, symbols: list[str] | None = None) -> pd.DataFrame:
@@ -129,11 +161,15 @@ def main() -> None:
     ap.add_argument("--days", nargs="+", required=True)
     ap.add_argument("--symbols", nargs="+")
     ap.add_argument("--window", nargs=2, type=int, default=[0, 24])
-    ap.add_argument("--sample-ms", type=int, default=1000)
+    ap.add_argument("--sample-ms", type=int, default=1000,
+                    help="training-row spacing (raw data is untouched). 1000: more rows, heavier; 2000: half the rows "
+                         "and disk, nearly the same information because adjacent 1 s rows are highly overlapping")
     ap.add_argument("--eval-ms", type=int, default=250)
     ap.add_argument("--latency-ms", type=int, default=100)
     ap.add_argument("--workers", type=int, default=4)
     a = ap.parse_args()
+    if a.sample_ms % a.eval_ms or a.sample_ms < a.eval_ms:
+        raise SystemExit("--sample-ms must be a positive multiple of --eval-ms")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from v3.store import store_symbols
 
@@ -146,6 +182,8 @@ def main() -> None:
             log.info("%s %s rows=%d dropped=%s gaps=%d (%ss)", st["symbol"], st["day"], st["rows"], st["dropped"],
                      st["l2_gaps"], st["seconds"])
             allstats.append(st)
+            if st.get("sha256"):
+                update_manifest(a.out, [st])
     with open(os.path.join(a.out, "build_stats.json"), "a", encoding="utf-8") as fh:
         for st in allstats:
             fh.write(json.dumps(st) + "\n")

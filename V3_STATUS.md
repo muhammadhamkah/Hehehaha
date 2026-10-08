@@ -22,6 +22,7 @@ this. V3 is refused in live mode.
 | L2 book | `v3/book.py` | Binance diff-depth sync rules. Any continuity break (pu mismatch, unbridged snapshot, crossed book) is a GAP: the book is invalid until rebuilt from a snapshot. Per-level change attribution. Multi-level book walk for slippage. |
 | Recorder | `v3/recorder.py` | Records `depth@100ms`, `depth20@100ms`, `bookTicker` and `aggTrade` for each symbol. Keeps local and exchange timestamps and update ids. Writes the REST snapshot used for every resync, plus an audit snapshot every 10 min. Live continuity validation: on a gap it writes a `__gap__` marker and rebuilds from a snapshot. Also: depth20 cross-check, per-minute health log, server-time samples, writer-drop detection, disk guard. Public data only; no keys, no orders. |
 | Deployment | `deploy/` | systemd unit and Dockerfile for unattended recording. |
+| Storage | `v3/compact.py`, `v3/storage.py`, `v3/cleanup_training_raw.py` | Lossless zstd recompression of closed hours, verified before the original is deleted. Hard `--max-gb` budget with a clean, logged stop. First-hours storage projection from actual bytes. Manual, guarded deletion of raw training days (dry run by default; never deletes validation/test data). |
 | QA | `v3/qa.py` | Per-day, per-symbol recording quality, plus `--deep` offline re-validation of every diff. Marks which days are usable. |
 | Store reader | `v3/store.py` | Merges the per-symbol stores, so the existing replay simulator reads V3 recordings directly. |
 | Features | `v3/features.py` | About 230 L2, queue, cancellation, flow, temporal and event features (list in the runbook §6). Includes explicit queue-depletion, liquidity-pulling and absorption features. |
@@ -66,8 +67,10 @@ All 114 existing tests and the 13 new V3 tests pass.
 
 1. Run `python -m tools.validate_binance` on the recording machine. All checks must pass,
    including `diff_depth_sync`.
-2. Record BTCUSDT, ETHUSDT and SOLUSDT. After one clean QA day, add DOGEUSDT and LINKUSDT.
-   Run `python -m v3.qa --store /data/l2 --deep` daily.
+2. Record BTCUSDT, ETHUSDT and SOLUSDT for 14 days, configured for the 130 GB machine:
+   `python -m v3.recorder --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT --no-depth20 --max-gb 95 --min-free-gb 10 --days 14`.
+   After 1–3 hours run `python -m v3.storage --store /data/l2 --max-gb 95`. If 14 days does not fit,
+   stop and review; the diff-depth feed is never reduced. Run `python -m v3.qa --store /data/l2 --deep` daily.
 3. After at least 7 (preferably 14–30) usable days, fix the TRAIN / CALIBRATION / SELECTION / TEST
    split **in writing before looking at any results**.
 4. Run `v3.dataset` → `v3.research` (test days forbidden) → `v3.evaluate` (validation), then

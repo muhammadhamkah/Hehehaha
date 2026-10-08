@@ -69,6 +69,7 @@ class EventWriter:
         self._q: queue.Queue = queue.Queue(maxsize=200_000)
         self._dropped = 0
         self.n_written = 0
+        self.current_path: str | None = None     # file currently open for appending (never compacted)
         self._thread = threading.Thread(target=self._run, name="event-writer", daemon=True)
         self._thread.start()
 
@@ -113,10 +114,12 @@ class EventWriter:
                     fh.close()
                 fh = gzip.open(path, "at", compresslevel=3, encoding="utf-8")
                 cur = path
+                self.current_path = path
             fh.write(json.dumps({"r": local_ts, "c": conn, "s": stream, "d": data}, separators=(",", ":")) + "\n")
             self.n_written += 1
         if fh is not None:
             fh.close()
+        self.current_path = None
 
     @property
     def dropped(self) -> int:
@@ -129,8 +132,28 @@ class EventWriter:
             log.error("event writer dropped %d events in total", self._dropped)
 
 
+EVENT_EXTS = (".jsonl.gz", ".jsonl.zst", ".jsonl.xz")   # .zst: closed hours recompressed by v3.compact
+
+
 def list_event_files(root: str) -> list[str]:
-    return sorted(glob.glob(os.path.join(root, "*", "*.jsonl.gz")) + glob.glob(os.path.join(root, "*.jsonl.gz")))
+    out = []
+    for ext in EVENT_EXTS:
+        out += glob.glob(os.path.join(root, "*", "*" + ext)) + glob.glob(os.path.join(root, "*" + ext))
+    return sorted(out)
+
+
+def open_event_file(path: str):
+    """Text reader for any recorded format (lossless: gzip, zstd, xz)."""
+    if path.endswith(".zst"):
+        import io
+
+        import zstandard
+        raw = open(path, "rb")
+        return io.TextIOWrapper(zstandard.ZstdDecompressor().stream_reader(raw, closefd=True), encoding="utf-8")
+    if path.endswith(".xz"):
+        import lzma
+        return lzma.open(path, "rt", encoding="utf-8")
+    return gzip.open(path, "rt", encoding="utf-8")
 
 
 def load_meta(root: str) -> dict:
@@ -173,7 +196,7 @@ class EventReader:
     def _raw(self) -> Iterator[ReplayEvent]:
         seq = 0
         for path in self.files:
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
+            with open_event_file(path) as fh:
                 for line in fh:
                     try:
                         o = json.loads(line)

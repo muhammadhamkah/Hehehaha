@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 from v3.book import ASK, BID, GAP, L2Book
 
+FEATURE_VERSION = "v3-features-1"     # bump whenever any feature definition changes
 NAN = float("nan")
 DEPTH_LEVELS = (1, 3, 5, 10, 20)
 WINDOWS_MS = (1000, 3000, 10000)
