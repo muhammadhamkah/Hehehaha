@@ -26,3 +26,6 @@ v2_models_xgb_mlp.log
 runs_v2_twostage.sh
 v2_twostage.log
 *.pid
+data/l2/
+data/v3/
+models/v3/

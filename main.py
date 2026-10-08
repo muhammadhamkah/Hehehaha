@@ -107,6 +107,10 @@ class TradingBot:
             from strategy.v2 import SignalEngineV2
 
             self.signals = SignalEngineV2(cfg, self.costs, self.recorder, self.risk, cfg.strategy.v2_model_dir)
+        elif cfg.strategy.predictor == "v3":
+            from strategy.v3 import SignalEngineV3
+
+            self.signals = SignalEngineV3(cfg, self.costs, self.recorder, self.risk, cfg.v3.model_dir)
         else:
             self.signals = SignalEngine(cfg, self.predictor, self.entry_filter, self.recorder, self.risk)
         self.exit_engine = ExitEngine(cfg, self.costs.maker_fee, self.costs.taker_fee)
@@ -259,11 +263,22 @@ class TradingBot:
         if self.event_writer is not None:
             self.event_writer.write("detail", stream, data, ts)
         self.risk.heartbeat("detail", ts)
+        on_detail = getattr(self.signals, "on_detail", None)
+        if on_detail is not None:
+            on_detail(stream, data, ts)          # V3: raw messages into the L2 research state
         sym_lower, _, kind = stream.partition("@")
         symbol = sym_lower.upper()
         if sym_lower == "__snapshot__":
             self._apply_recorded_snapshot(kind, data, ts)
             return
+        if sym_lower == "__snapshot_audit__":
+            # periodic snapshots in V3 recordings: only used to initialise an unsynced book
+            book = self.books.get(kind)
+            if book is not None and not book.synced:
+                self._apply_recorded_snapshot(kind, data, ts)
+            return
+        if sym_lower.startswith("__"):
+            return                               # V3 recorder markers (__gap__, __resync__, __check__)
         book = self.books.get(symbol)
         flow = self.flows.get(symbol)
         if book is None or flow is None:

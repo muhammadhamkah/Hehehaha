@@ -230,7 +230,10 @@ class EventReader:
 def open_reader(root: str, **kw):
     """EventReader for recorded events, ArchiveReader for a public-archive manifest dir."""
     from data.archive_reader import ArchiveReader, is_archive_dir
+    from v3.store import V3StoreReader, is_v3_store
 
+    if is_v3_store(root):
+        return V3StoreReader(root, **{k: v for k, v in kw.items() if v is not None})
     if is_archive_dir(root):
         kw.pop("reorder_window_ms", None)
         return ArchiveReader(root, **kw)

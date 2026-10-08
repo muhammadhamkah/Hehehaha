@@ -164,7 +164,7 @@ def run_replay(cfg: BotConfig, spec: ReplaySpec) -> dict[str, Any]:
             if ev.conn == "market":
                 stats["market"] += 1
                 bot._on_market_msg(ev.stream, ev.data, ev.ts)
-            elif ev.stream in bot.detail_ws.streams or ev.stream.startswith("__snapshot__"):
+            elif ev.stream in bot.detail_ws.streams or ev.stream.startswith(("__snapshot__", "__snapshot_audit__")):
                 stats["delivered"] += 1
                 bot._on_detail_msg(ev.stream, ev.data, ev.ts)
             else:

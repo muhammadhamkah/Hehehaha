@@ -267,6 +267,19 @@ exits only ever use that object. To switch models, implement `BasePredictor.pred
 or train with `research/train_model.py`, then register it in `build_predictor`. Nothing in
 execution has to change.
 
+## V3: L2 order-book directional research (research only)
+
+V2 found that the L1 archive predicts *when* large moves happen but not *which way*. V3 tests whether
+full L2 depth and queue dynamics carry the missing directional information. It is a separate path:
+V1/V2 and their locked results are unchanged, and V3 is refused in live mode.
+
+- `v3/recorder.py`: standalone L2 recorder (diff depth with strict continuity, depth20, bookTicker,
+  aggTrade, snapshots, gap markers, health log); deploy with `deploy/`; check quality with `v3/qa.py`
+- `v3/dataset.py` → `v3/research.py` → `v3/evaluate.py`: L2/queue/cancellation/flow features, barrier
+  labels, ablation (L1 / L2 / flow / L1+L2 / all), Stage-A-gated direction study, entry timing, and
+  execution-aware replay with a locked test
+- Status and synthetic validation: `V3_STATUS.md`; step-by-step: `docs/V3_RUNBOOK.md`
+
 ## Known limitations / next steps
 
 * **Not yet verified against live Binance.** Run `tools.validate_binance` first.

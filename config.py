@@ -108,7 +108,7 @@ class FeatureConfig:
 
 @dataclass
 class StrategyConfig:
-    predictor: str = "rule"               # "rule" (V1), "linear" (V1 + trained linear) or "v2"
+    predictor: str = "rule"               # "rule" (V1), "linear" (V1 + trained linear), "v2" or "v3"
     v2_model_dir: str = "models/v2/lightgbm"
     v2_threshold: float | None = None     # None -> threshold selected during model research
     model_path: str = "models/linear_model.json"
@@ -251,6 +251,13 @@ class RecorderConfig:
 
 
 @dataclass
+class V3Config:
+    """V3 (L2 research) serving settings. Research-only: refused in live mode."""
+    model_dir: str = "models/v3/v3_all"
+    threshold: float | None = None        # None -> threshold selected on the selection days
+
+
+@dataclass
 class BotConfig:
     mode: str = "paper"                   # "record" | "paper" | "live"
     dry_run: bool = True
@@ -267,6 +274,7 @@ class BotConfig:
     exit: ExitConfig = field(default_factory=ExitConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
+    v3: V3Config = field(default_factory=V3Config)
 
     def live_trading_enabled(self) -> bool:
         return (
@@ -305,6 +313,8 @@ class BotConfig:
             problems.append("exit.mode must be 'v1' or 'barrier'")
         if self.strategy.predictor == "v2" and self.mode == "live":
             problems.append("V2 predictor is not approved for live trading (no credible out-of-sample edge yet)")
+        if self.strategy.predictor == "v3" and self.mode == "live":
+            problems.append("V3 predictor is research-only and not approved for live trading")
         if self.entry.min_net_profit_usdt <= 0:
             problems.append("entry.min_net_profit_usdt must be positive")
         if self.mode == "live" and not self.dry_run and not self.live_trading_enabled():
@@ -321,6 +331,8 @@ class BotConfig:
         d = self.to_dict()
         for k in ("recorder", "exchange", "log_level"):
             d.pop(k, None)
+        if d.get("v3") == asdict(V3Config()):
+            d.pop("v3")       # V3 settings at defaults do not change V1/V2 fingerprints (locked tests)
         return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
     def to_dict(self) -> dict[str, Any]:
