@@ -464,3 +464,32 @@ def test_cleanup_training_raw_guards(built, tmp_path):
     finally:
         sys.argv = argv
     assert sorted(_g.glob(os.path.join(st, "*", "*", "*"))) == before
+
+
+def test_recorder_stops_when_storage_disappears(tmp_path):
+    import shutil
+    from tests.mock_binance import MockBinanceServer
+    from v3.recorder import L2Recorder, RecorderConfig
+
+    out = str(tmp_path / "ssd" / "l2")
+
+    async def go():
+        srv = MockBinanceServer()
+        runner, host = await srv.start()
+        cfg = RecorderConfig(out=out, symbols=("BTCUSDT",), rest_base=f"http://{host}", ws_base=f"ws://{host}",
+                             duration_s=10.0, health_interval_s=5.0, budget_check_s=0.3, min_free_gb=0.0,
+                             max_gb=None, partial_stream="", compress=False)
+        rec = L2Recorder(cfg)
+
+        async def unplug():
+            await asyncio.sleep(1.5)
+            shutil.rmtree(str(tmp_path / "ssd"))       # external drive removed mid-recording
+        asyncio.ensure_future(unplug())
+        try:
+            await rec.run()
+        finally:
+            await runner.cleanup()
+        return rec
+
+    rec = asyncio.run(go())
+    assert rec.stop_reason == "write_error"

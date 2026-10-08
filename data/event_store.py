@@ -70,6 +70,7 @@ class EventWriter:
         self._dropped = 0
         self.n_written = 0
         self.current_path: str | None = None     # file currently open for appending (never compacted)
+        self.error: str | None = None            # set if the writer thread hit an I/O error and stopped
         self._thread = threading.Thread(target=self._run, name="event-writer", daemon=True)
         self._thread.start()
 
@@ -103,23 +104,31 @@ class EventWriter:
     def _run(self) -> None:
         fh = None
         cur = None
-        while True:
-            item = self._q.get()
-            if item is None:
-                break
-            local_ts, conn, stream, data = item
-            path = self._path(local_ts)
-            if path != cur:
-                if fh is not None:
+        try:
+            while True:
+                item = self._q.get()
+                if item is None:
+                    break
+                local_ts, conn, stream, data = item
+                path = self._path(local_ts)
+                if path != cur:
+                    if fh is not None:
+                        fh.close()
+                    fh = gzip.open(path, "at", compresslevel=3, encoding="utf-8")
+                    cur = path
+                    self.current_path = path
+                fh.write(json.dumps({"r": local_ts, "c": conn, "s": stream, "d": data}, separators=(",", ":")) + "\n")
+                self.n_written += 1
+        except OSError as exc:      # disk removed / full / read-only: report it, never fail silently
+            self.error = f"{type(exc).__name__}: {exc}"
+            log.critical("event writer for %s failed: %s", self.root, self.error)
+        finally:
+            if fh is not None:
+                try:
                     fh.close()
-                fh = gzip.open(path, "at", compresslevel=3, encoding="utf-8")
-                cur = path
-                self.current_path = path
-            fh.write(json.dumps({"r": local_ts, "c": conn, "s": stream, "d": data}, separators=(",", ":")) + "\n")
-            self.n_written += 1
-        if fh is not None:
-            fh.close()
-        self.current_path = None
+                except OSError:
+                    pass
+            self.current_path = None
 
     @property
     def dropped(self) -> int:

@@ -211,10 +211,13 @@ class L2Recorder:
         rec = {"ts": ts, "reason": reason, **detail}
         log.critical("STOPPING RECORDER: %s %s", reason, detail)
         self.system.write("detail", "__stop__@ALL", rec, ts)
-        d = os.path.join(self.cfg.out, "_health")
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "stops.jsonl"), "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec) + "\n")
+        try:
+            d = os.path.join(self.cfg.out, "_health")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "stops.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except OSError as exc:
+            log.critical("could not write the stop record (%s); reason was: %s", exc, reason)
         self._stop.set()
 
     # ------------------------------------------------------------------ storage
@@ -234,9 +237,17 @@ class L2Recorder:
     async def _budget_loop(self) -> None:
         while True:
             await asyncio.sleep(self.cfg.budget_check_s)
-            self._check_budget()
+            try:
+                self._check_budget()
+            except OSError as exc:
+                self._halt("write_error", {"errors": {self.cfg.out: str(exc)}})
 
     def _check_budget(self) -> None:
+        failed = {w.root: w.error for w in [self.system] + [st.writer for st in self.sym.values()] if w.error}
+        if failed or not os.path.isdir(self.cfg.out):
+            # storage gone (external drive unplugged / full / read-only): stop instead of losing data silently
+            self._halt("write_error", {"errors": failed or {self.cfg.out: "output directory missing"}})
+            return
         size = store_size(self.cfg.out)
         t = time.time()
         rate = 0.0
@@ -394,6 +405,14 @@ class L2Recorder:
             self._health_tick()
 
     def _health_tick(self, final: bool = False) -> None:
+        try:
+            self._health_tick_inner(final)
+        except OSError as exc:
+            log.critical("health check could not access %s: %s", self.cfg.out, exc)
+            if not final:
+                self._halt("write_error", {"errors": {self.cfg.out: str(exc)}})
+
+    def _health_tick_inner(self, final: bool) -> None:
         ts = now_ms()
         free_gb = shutil.disk_usage(self.cfg.out).free / 1e9
         rec: dict[str, Any] = {"ts": ts, "final": final, "free_gb": round(free_gb, 2),

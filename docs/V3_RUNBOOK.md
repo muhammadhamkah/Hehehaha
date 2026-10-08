@@ -47,6 +47,17 @@ python -m v3.recorder --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT \
 - **Budgets:** the recorder stops cleanly before 95 GB, or when the drive has less than 10 GB
   free.
 
+**External SSD:**
+
+- Point `--out` at the SSD, for example `/Volumes/<SSD>/l2` on macOS or `D:\l2` on Windows. The
+  code can live anywhere.
+- `--max-gb` and `--min-free-gb` both measure the drive that `--out` is on.
+- Keep the SSD plugged in and disable disk sleep (macOS: Energy → untick "Put hard disks to
+  sleep"; Windows: turn off USB selective suspend). Use exFAT, NTFS or APFS.
+- If the drive disappears, fills or turns read-only mid-recording, the recorder stops cleanly
+  (`write_error`) instead of losing data silently. Start it again with the same command once the
+  drive is back; it continues in the same store.
+
 For unattended operation, `deploy/v3-recorder.service` (systemd) and `deploy/Dockerfile.recorder`
 already contain these flags.
 
