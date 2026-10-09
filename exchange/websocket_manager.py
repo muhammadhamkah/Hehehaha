@@ -166,7 +166,9 @@ class StreamConnection:
                     log.warning("ws[%s] unexpected message: %.200s", self.name, msg.data)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
                               aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                log.info("ws[%s] socket closed (%s)", self.name, msg.type.name)
+                log.info("ws[%s] socket closed (%s) code=%s reason=%r after %.0fs", self.name, msg.type.name,
+                         ws.close_code, msg.extra if msg.type == aiohttp.WSMsgType.CLOSE else ws.exception(),
+                         time.monotonic() - started)
                 break
             if time.monotonic() - started > self.max_age_s:
                 log.info("ws[%s] recycling connection (age limit)", self.name)
