@@ -15,6 +15,14 @@ Pipeline
 """
 from __future__ import annotations
 
+import os as _os
+
+# Pin BLAS/OpenMP to one thread BEFORE numpy loads: the barrier model uses tiny matrices,
+# and parallel replay workers each spawning a BLAS thread pool oversubscribed the CPU
+# (observed: replay slowed to below real time).
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    _os.environ.setdefault(_var, "1")
+
 import argparse
 import asyncio
 import json
@@ -31,10 +39,12 @@ from data.recorder import Recorder
 from exchange.binance_client import BinanceFuturesClient
 from exchange.execution import ExchangeAdapter, LiveExchange, PaperExchange, TradeExecutor
 from exchange.models import Order, SymbolInfo
+from exchange.schemas import FeedValidator
 from exchange.websocket_manager import StreamConnection, UserDataStream
-from market_data.orderbook import OrderBook, SyncStatus
+from market_data.orderbook import OrderBook
 from market_data.scanner import MarketScanner
-from market_data.tradeflow import Trade, TradeFlow
+from market_data.state import apply_detail, make_book
+from market_data.tradeflow import TradeFlow
 from risk.risk_manager import RiskManager
 from strategy.costs import CostModel
 from strategy.entry_filter import EntryFilter
@@ -46,11 +56,34 @@ from utils.clock import SYSTEM_CLOCK, Clock
 log = logging.getLogger("bot")
 
 
+class OfflineStreams:
+    """Stand-in for a StreamConnection during replay: tracks the subscribed stream set so
+    the replay driver delivers only events the live bot would actually have received."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.streams: set[str] = set()
+
+    async def set_streams(self, streams) -> None:
+        self.streams = set(streams)
+
+    async def run(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
 class TradingBot:
-    def __init__(self, cfg: BotConfig, clock: Clock = SYSTEM_CLOCK) -> None:
+    def __init__(self, cfg: BotConfig, clock: Clock = SYSTEM_CLOCK, offline: bool = False,
+                 event_writer=None, rng_seed: int | None = None) -> None:
+        """offline=True: no REST/WebSocket I/O; market events are pushed in by a replay
+        driver through the same handlers. Live trading is never enabled offline."""
         self.cfg = cfg
         self.clock = clock
-        self.live = cfg.live_trading_enabled()
+        self.offline = offline
+        self.event_writer = event_writer
+        self.live = cfg.live_trading_enabled() and not offline
         self.trading = cfg.trading_enabled()
         self.mode_label = "live" if self.live else "paper"
 
@@ -62,13 +95,24 @@ class TradingBot:
         self.symbol_info: dict[str, SymbolInfo] = {}
 
         self.db = Database(cfg.recorder.db_path, cfg.recorder.flush_interval_s)
-        self.recorder = Recorder(cfg, self.db)
+        import random as _random
+        self.recorder = Recorder(cfg, self.db, _random.Random(rng_seed) if rng_seed is not None else None)
+        self.feed = FeedValidator()
         self.trade_logger = TradeLogger(self.db, cfg.recorder.trades_jsonl)
 
         self.costs = CostModel(cfg.costs)
         self.predictor = build_predictor(cfg.strategy)
         self.entry_filter = EntryFilter(cfg, self.costs)
-        self.signals = SignalEngine(cfg, self.predictor, self.entry_filter, self.recorder, self.risk)
+        if cfg.strategy.predictor == "v2":
+            from strategy.v2 import SignalEngineV2
+
+            self.signals = SignalEngineV2(cfg, self.costs, self.recorder, self.risk, cfg.strategy.v2_model_dir)
+        elif cfg.strategy.predictor == "v3":
+            from strategy.v3 import SignalEngineV3
+
+            self.signals = SignalEngineV3(cfg, self.costs, self.recorder, self.risk, cfg.v3.model_dir)
+        else:
+            self.signals = SignalEngine(cfg, self.predictor, self.entry_filter, self.recorder, self.risk)
         self.exit_engine = ExitEngine(cfg, self.costs.maker_fee, self.costs.taker_fee)
 
         self.adapter: ExchangeAdapter
@@ -78,18 +122,12 @@ class TradingBot:
             self.adapter = PaperExchange(cfg, self.books, self.costs, clock, on_order=self._on_order)
         self.executor = TradeExecutor(cfg, self.adapter, self.books, self.symbol_info, clock)
 
-        self.market_ws = StreamConnection(
-            "market", cfg.exchange.ws_url, self._on_market_msg,
-            on_connect=self.risk.heartbeat, on_disconnect=self.risk.on_disconnect,
-            max_backoff_s=cfg.exchange.ws_reconnect_max_backoff_s,
-            max_age_s=cfg.exchange.ws_max_connection_age_s,
-        )
-        self.detail_ws = StreamConnection(
-            "detail", cfg.exchange.ws_url, self._on_detail_msg,
-            on_connect=self.risk.heartbeat, on_disconnect=self.risk.on_disconnect,
-            max_backoff_s=cfg.exchange.ws_reconnect_max_backoff_s,
-            max_age_s=cfg.exchange.ws_max_connection_age_s,
-        )
+        self.market_ws: StreamConnection | OfflineStreams
+        self.detail_ws: StreamConnection | OfflineStreams
+        if offline:
+            self.market_ws, self.detail_ws = OfflineStreams("market"), OfflineStreams("detail")
+        else:
+            self._make_ws()
         self.user_ws: UserDataStream | None = None
 
         self.positions: dict[str, Position] = {}
@@ -102,12 +140,37 @@ class TradingBot:
         self._last_scanner_record = 0
         self.n_evals = 0
         self.n_entries = 0
+        # Replay warm-up: market state is built from earlier events, but no trades are
+        # opened and no signals recorded before this timestamp.
+        self.active_from_ms = 0
+        self.active_until_ms = float("inf")   # replay segment end: no evaluations at/after it
+
+    def _make_ws(self) -> None:
+        cfg = self.cfg
+        self.market_ws = StreamConnection(
+            "market", cfg.exchange.ws_url, self._on_market_msg,
+            on_connect=self.risk.heartbeat, on_disconnect=self.risk.on_disconnect,
+            max_backoff_s=cfg.exchange.ws_reconnect_max_backoff_s,
+            max_age_s=cfg.exchange.ws_max_connection_age_s,
+            max_streams=cfg.exchange.ws_max_streams_per_connection,
+            silence_timeout_s=cfg.exchange.ws_silence_timeout_s,
+        )
+        self.detail_ws = StreamConnection(
+            "detail", cfg.exchange.ws_url, self._on_detail_msg,
+            on_connect=self.risk.heartbeat, on_disconnect=self.risk.on_disconnect,
+            max_backoff_s=cfg.exchange.ws_reconnect_max_backoff_s,
+            max_age_s=cfg.exchange.ws_max_connection_age_s,
+            max_streams=cfg.exchange.ws_max_streams_per_connection,
+            silence_timeout_s=cfg.exchange.ws_silence_timeout_s,
+        )
 
     # ================================================================== startup
     async def start(self) -> None:
         problems = self.cfg.validate()
         if problems:
             raise SystemExit("config problems:\n  " + "\n  ".join(problems))
+        if self.cfg.risk.research_mode:
+            raise SystemExit("risk.research_mode is RESEARCH-ONLY and refused outside offline replay")
         log.info("mode=%s dry_run=%s live_orders=%s trading=%s", self.cfg.mode, self.cfg.dry_run,
                  self.live, self.trading)
         if self.cfg.mode == "live" and not self.live:
@@ -120,6 +183,15 @@ class TradingBot:
         self.symbol_info.update(await self.client.perpetual_symbols(self.cfg.scanner.quote_asset))
         self.scanner.set_universe(set(self.symbol_info))
         log.info("universe: %d USDT-M perpetuals", len(self.symbol_info))
+        if self.event_writer is not None:
+            from dataclasses import asdict
+            self.event_writer.write_meta({
+                "symbol_info": {k: asdict(v) for k, v in self.symbol_info.items()},
+                "depth_mode": self.cfg.market_data.depth_mode,
+                "depth_levels": self.cfg.market_data.depth_levels,
+                "source": "binance_ws_live",
+            })
+            log.info("recording raw events to %s", self.cfg.recorder.events_dir)
 
         if self.live:
             await self._live_preflight()
@@ -129,6 +201,15 @@ class TradingBot:
         self._spawn(self.detail_ws.run(), "detail_ws")
         if self.user_ws is not None:
             self._spawn(self.user_ws.run(), "user_ws")
+        await self.start_core()
+
+    async def start_core(self, symbol_info: dict[str, SymbolInfo] | None = None) -> None:
+        """Start the strategy loops. Used directly by the offline replay driver."""
+        if symbol_info is not None:
+            self.symbol_info.update(symbol_info)
+            self.scanner.set_universe(set(self.symbol_info))
+        if self.offline:
+            await self.market_ws.set_streams(["!ticker@arr", "!bookTicker"])
         self._spawn(self._scanner_loop(), "scanner")
         self._spawn(self._eval_loop(), "eval")
         self._spawn(self._position_loop(), "positions")
@@ -165,68 +246,84 @@ class TradingBot:
 
     # ================================================================== market data
     def _on_market_msg(self, stream: str, data, ts: int) -> None:
+        if self.event_writer is not None:
+            self.event_writer.write("market", stream, data, ts)
         self.risk.heartbeat("market", ts)
         if stream == "!ticker@arr":
-            for t in data:
+            for t in self.feed.ticker_arr(stream, data, ts):
                 self.scanner.on_ticker(t, ts)
         elif stream == "!bookTicker":
-            self.scanner.on_book_ticker(data, ts)
+            bt = self.feed.book_ticker(stream, data, ts)
+            if bt is not None:
+                self.scanner.on_book_ticker(data, ts)
+        else:
+            self.feed.report_unexpected(stream, data)
 
     def _on_detail_msg(self, stream: str, data, ts: int) -> None:
+        if self.event_writer is not None:
+            self.event_writer.write("detail", stream, data, ts)
         self.risk.heartbeat("detail", ts)
+        on_detail = getattr(self.signals, "on_detail", None)
+        if on_detail is not None:
+            on_detail(stream, data, ts)          # V3: raw messages into the L2 research state
         sym_lower, _, kind = stream.partition("@")
         symbol = sym_lower.upper()
+        if sym_lower == "__snapshot__":
+            self._apply_recorded_snapshot(kind, data, ts)
+            return
+        if sym_lower == "__snapshot_audit__":
+            # periodic snapshots in V3 recordings: only used to initialise an unsynced book
+            book = self.books.get(kind)
+            if book is not None and not book.synced:
+                self._apply_recorded_snapshot(kind, data, ts)
+            return
+        if sym_lower.startswith("__"):
+            return                               # V3 recorder markers (__gap__, __resync__, __check__)
         book = self.books.get(symbol)
         flow = self.flows.get(symbol)
         if book is None or flow is None:
-            return
-        if kind == "aggTrade":
-            t = Trade(int(data["T"]), float(data["p"]), float(data["q"]), bool(data["m"]))
-            flow.add(t, ts, int(data.get("a", 0)))
+            return  # late message for a symbol we just unsubscribed from
+        res = apply_detail(book, flow, self.feed, self.cfg.market_data.depth_mode, symbol, kind, stream, data, ts)
+        if res.kind == "trade":
             if isinstance(self.adapter, PaperExchange):
-                self.adapter.on_trade(symbol, t)
+                self.adapter.on_trade(symbol, res.trade)
             return
-        if kind.startswith("depth"):
-            if self.cfg.market_data.depth_mode == "partial":
-                book.apply_snapshot(
-                    ((float(p), float(q)) for p, q in data["b"]),
-                    ((float(p), float(q)) for p, q in data["a"]),
-                    int(data.get("u", 0)), int(data.get("E", ts)), ts,
-                )
-            else:
-                status = book.apply_diff(data, ts)
-                if status == SyncStatus.RESYNC or status == SyncStatus.BUFFERING:
-                    if status == SyncStatus.RESYNC:
-                        book.last_update_id = 0
-                        book.buffer_diff(data)
-                    self._schedule_resync(symbol)
-        elif kind == "bookTicker":
-            book.update_bbo(float(data["b"]), float(data["B"]), float(data["a"]), float(data["A"]), ts)
-        else:
+        if res.kind == "resync":
+            self._schedule_resync(symbol)   # (falls through, as before the refactor)
+        elif res.kind != "book":
             return
         bid, _, ask, _ = book.best()
         self.recorder.on_quote(symbol, ts, bid, ask)
         if isinstance(self.adapter, PaperExchange):
             self.adapter.on_book(symbol)
 
+    def _apply_recorded_snapshot(self, symbol: str, snap: dict, ts: int) -> None:
+        book = self.books.get(symbol)
+        if book is None:
+            return
+        status = book.sync_from_snapshot(
+            [(float(p), float(q)) for p, q in snap["bids"]],
+            [(float(p), float(q)) for p, q in snap["asks"]],
+            int(snap["lastUpdateId"]), ts,
+        )
+        self._resyncing.discard(symbol)
+        log.info("%s diff book resync (recorded snapshot): %s", symbol, status)
+
     def _schedule_resync(self, symbol: str) -> None:
         if symbol in self._resyncing:
             return
         self._resyncing.add(symbol)
+        if self.offline:
+            return  # replay: the recorded REST snapshot arrives as a "__snapshot__" event
 
         async def resync() -> None:
             try:
                 await asyncio.sleep(0.5)  # let a few diffs buffer first
                 snap = await self.client.depth(symbol, self.cfg.market_data.diff_snapshot_limit)
-                book = self.books.get(symbol)
-                if book is None:
-                    return
-                status = book.sync_from_snapshot(
-                    [(float(p), float(q)) for p, q in snap["bids"]],
-                    [(float(p), float(q)) for p, q in snap["asks"]],
-                    int(snap["lastUpdateId"]), self.clock.now_ms(),
-                )
-                log.info("%s diff book resync: %s", symbol, status)
+                now = self.clock.now_ms()
+                if self.event_writer is not None:
+                    self.event_writer.write("detail", f"__snapshot__@{symbol}", snap, now)
+                self._apply_recorded_snapshot(symbol, snap, now)
             except Exception as exc:  # noqa: BLE001
                 log.warning("%s resync failed: %s", symbol, exc)
             finally:
@@ -235,12 +332,14 @@ class TradingBot:
         asyncio.ensure_future(resync())
 
     def _detail_streams(self, symbols: list[str]) -> list[str]:
-        depth = (f"@depth{self.cfg.market_data.depth_levels}@100ms"
-                 if self.cfg.market_data.depth_mode == "partial" else "@depth@100ms")
+        mode = self.cfg.market_data.depth_mode
+        depth = {"partial": f"@depth{self.cfg.market_data.depth_levels}@100ms", "diff": "@depth@100ms"}.get(mode)
         out = []
         for s in symbols:
             sl = s.lower()
-            out += [f"{sl}@aggTrade", f"{sl}{depth}", f"{sl}@bookTicker"]
+            out += [f"{sl}@aggTrade", f"{sl}@bookTicker"]
+            if depth:
+                out.append(f"{sl}{depth}")
         return out
 
     # ================================================================== loops
@@ -255,7 +354,8 @@ class TradingBot:
             active = self.scanner.select(now)
             for s in active:
                 if s not in self.books:
-                    self.books[s] = OrderBook(s, self.cfg.market_data.book_history_len)
+                    md = self.cfg.market_data
+                    self.books[s] = make_book(s, md.book_history_len, md.depth_mode, md.bbo_history_interval_ms)
                     self.flows[s] = TradeFlow(s, self.cfg.market_data.trade_history_s)
             for s in list(self.books):
                 if s not in active and s not in self.positions:
@@ -280,12 +380,14 @@ class TradingBot:
                 if symbol in self.positions or symbol in self._entering:
                     continue
                 self.n_evals += 1
-                res = self.signals.evaluate(symbol, book, flow, now, trading_enabled=self.trading)
+                active = self.active_from_ms <= now < self.active_until_ms
+                res = self.signals.evaluate(symbol, book, flow, now, trading_enabled=self.trading and active,
+                                            record=active)
                 if res.action == "enter" and not self._entering and \
                         len(self.positions) < self.cfg.sizing.max_simultaneous_positions:
                     self._entering.add(symbol)
                     asyncio.ensure_future(self._enter(res))
-                elif res.action == "would_enter":
+                elif res.action == "would_enter" and active:
                     log.info("WOULD ENTER %s dir=%+d conf=%.3f exp_net=%.4f", symbol,
                              res.decision.plan.direction, res.decision.plan.confidence,
                              res.decision.plan.expected_net_usdt)
@@ -310,7 +412,7 @@ class TradingBot:
                     self._start_exit(pos, "emergency_no_data", True)
                     continue
                 f = self.signals.features(book, flow, now)
-                pred = self.predictor.predict(f) if f else None
+                pred = self.predictor.predict(f) if f and self.cfg.exit.mode == "v1" else None
                 bid, _, ask, _ = book.best()
                 sig = self.exit_engine.update(pos, bid, ask, f, pred, now)
                 if sig is not None:
@@ -334,9 +436,12 @@ class TradingBot:
             if now - last_status > 30_000:
                 last_status = now
                 top_rej = sorted(self.signals.rejections.items(), key=lambda kv: -kv[1])[:6]
-                log.info("status evals=%d recorded=%d labeled=%d entries=%d open=%d risk=%s rejections=%s",
+                fs = self.feed.summary()
+                log.info("status evals=%d recorded=%d labeled=%d entries=%d open=%d risk=%s rejections=%s "
+                         "malformed=%s unexpected=%d",
                          self.n_evals, self.recorder.n_recorded, self.recorder.n_labeled, self.n_entries,
-                         len(self.positions), json.dumps(self.risk.status()), top_rej)
+                         len(self.positions), json.dumps(self.risk.status()), top_rej,
+                         fs["malformed_by_kind"], sum(fs["unexpected"].values()))
             await asyncio.sleep(max(self.cfg.recorder.raw_book_interval_ms / 1000.0, 1.0))
 
     # ================================================================== trading
@@ -508,6 +613,9 @@ class TradingBot:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self.recorder.flush_all()
+        if self.event_writer is not None:
+            self.event_writer.close()
+        log.info("feed health: %s", json.dumps(self.feed.summary()["by_kind"]))
         self.db.flush()
         trades = self.db.query("SELECT * FROM trades WHERE mode = ?", (self.mode_label,))
         if trades:
@@ -548,7 +656,11 @@ def main(argv: list[str] | None = None) -> None:
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
-    bot = TradingBot(cfg)
+    writer = None
+    if cfg.recorder.record_events:
+        from data.event_store import EventWriter
+        writer = EventWriter(cfg.recorder.events_dir)
+    bot = TradingBot(cfg, event_writer=writer)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     for sig in (signal.SIGINT, signal.SIGTERM):

@@ -10,6 +10,7 @@ persistence measures downstream.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from typing import Sequence
 
 from market_data.orderbook import BookState, OrderBook
@@ -42,15 +43,25 @@ def microprice_features(book: OrderBook) -> tuple[float, float, float]:
     return mp, (mp - mid) / mid * 1e4, tilt
 
 
+def _ts(s: BookState) -> int:
+    return s.ts_ms
+
+
+def _as_list(history: Sequence[BookState]) -> list[BookState]:
+    return history if isinstance(history, list) else list(history)
+
+
 def _window(history: Sequence[BookState], now_ms: int, window_s: float) -> list[BookState]:
+    """States with ts >= now - window (history is time-ordered)."""
+    h = _as_list(history)
     start = now_ms - int(window_s * 1000)
-    out: list[BookState] = []
-    for st in reversed(history):
-        if st.ts_ms < start:
-            break
-        out.append(st)
-    out.reverse()
-    return out
+    return h[bisect_left(h, start, key=_ts):]
+
+
+def _state_at_or_before(history: Sequence[BookState], target_ms: int) -> BookState | None:
+    h = _as_list(history)
+    i = bisect_right(h, target_ms, key=_ts) - 1
+    return h[i] if i >= 0 else None
 
 
 def order_flow_imbalance(history: Sequence[BookState], now_ms: int, window_s: float) -> float:
@@ -90,14 +101,7 @@ def depletion(history: Sequence[BookState], now_ms: int, lookback_s: float) -> t
     if not history:
         return 0.0, 0.0, 0.0
     cur = history[-1]
-    target = now_ms - int(lookback_s * 1000)
-    then = None
-    for st in reversed(history):
-        if st.ts_ms <= target:
-            then = st
-            break
-    if then is None:
-        then = history[0]
+    then = _state_at_or_before(history, now_ms - int(lookback_s * 1000)) or history[0]
     bid_d = (then.bid_depth5 - cur.bid_depth5) / then.bid_depth5 if then.bid_depth5 > 0 else 0.0
     ask_d = (then.ask_depth5 - cur.ask_depth5) / then.ask_depth5 if then.ask_depth5 > 0 else 0.0
     bid_d, ask_d = clip(bid_d, -1.0, 1.0), clip(ask_d, -1.0, 1.0)
@@ -156,14 +160,7 @@ def mid_momentum_bps(history: Sequence[BookState], now_ms: int, window_s: float)
     if not history:
         return 0.0
     cur = history[-1].mid
-    target = now_ms - int(window_s * 1000)
-    then = None
-    for st in reversed(history):
-        if st.ts_ms <= target:
-            then = st
-            break
-    if then is None:
-        then = history[0]
+    then = _state_at_or_before(history, now_ms - int(window_s * 1000)) or history[0]
     return (cur - then.mid) / then.mid * 1e4 if then.mid else 0.0
 
 

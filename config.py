@@ -38,6 +38,10 @@ class ExchangeConfig:
     ws_reconnect_max_backoff_s: float = 30.0
     # Binance drops connections at 24h; reconnect proactively before that.
     ws_max_connection_age_s: float = 23 * 3600
+    # Binance allows up to 1024 streams per futures connection; stay well below.
+    ws_max_streams_per_connection: int = 200
+    # Reconnect if a subscribed connection delivers no data for this long.
+    ws_silence_timeout_s: float = 10.0
 
     @property
     def rest_url(self) -> str:
@@ -61,6 +65,9 @@ class ScannerConfig:
     activity_window_s: float = 60.0
     min_age_for_ranking_s: float = 10.0
     exclude_symbols: tuple[str, ...] = ()
+    # If set, always analyse exactly these symbols (ranking still computed for logging).
+    # Used for fixed-universe recording and for replaying archive data without tickers.
+    static_symbols: tuple[str, ...] = ()
     # Ranking weights (applied to cross-sectional percentile ranks).
     w_volume: float = 1.0
     w_spread: float = 1.5
@@ -74,10 +81,14 @@ class ScannerConfig:
 class MarketDataConfig:
     # "partial" -> <sym>@depth20@100ms snapshots (robust, no sync needed)
     # "diff"    -> <sym>@depth@100ms diffs + REST snapshot (full local book)
+    # "bbo"     -> top of book only from bookTicker (L1 data, e.g. public archives)
     depth_mode: str = "partial"
     depth_levels: int = 20
     diff_snapshot_limit: int = 1000
     book_history_len: int = 600          # ~60s at 100ms
+    # bbo (tick-level L1) mode conflates book history into buckets of this size so the
+    # history covers the same ~60s as depth20@100ms; partial/diff modes record every update.
+    bbo_history_interval_ms: int = 100
     trade_history_s: float = 120.0
     stale_after_ms: int = 2000
 
@@ -97,7 +108,9 @@ class FeatureConfig:
 
 @dataclass
 class StrategyConfig:
-    predictor: str = "rule"               # "rule" or "linear"
+    predictor: str = "rule"               # "rule" (V1), "linear" (V1 + trained linear), "v2" or "v3"
+    v2_model_dir: str = "models/v2/lightgbm"
+    v2_threshold: float | None = None     # None -> threshold selected during model research
     model_path: str = "models/linear_model.json"
     eval_interval_ms: int = 250
     # Rule-based score weights
@@ -146,7 +159,11 @@ class EntryConfig:
     stop_bps: float = 8.0
     stop_vol_mult: float = 0.0            # >0: stop = max(stop_bps, mult * sigma_horizon)
     require_flow_confirmation: bool = True
+    # Directional thresholds for research sweeps; -1.0 disables them (default behaviour).
+    min_book_imbalance: float = -1.0      # direction * imb_weighted must be >= this
+    min_flow_imbalance: float = -1.0      # direction * flow_imb_3s must be >= this
     max_book_imbalance_abs: float = 0.97  # reject near-one-sided books (likely abnormal)
+    min_liquidity_change: float = -0.5    # reject if top-10 depth fell >50% vs its 10s average
     min_trades_per_s: float = 1.0
     max_realized_vol_bps_1s: float = 15.0 # abnormal volatility guard
 
@@ -179,6 +196,10 @@ class ExecutionConfig:
 
 @dataclass
 class ExitConfig:
+    # "v1": break-even / trailing / flow-reversal / imbalance / exhaustion / time exits
+    # "barrier": exactly the economics V2 is trained on -- TP at target, SL at stop,
+    #            time stop at strategy.max_hold_s (+ emergencies)
+    mode: str = "v1"
     # Break-even arms at max(trigger, net-break-even + buffer) so it never stops out instantly.
     break_even_trigger_bps: float = 10.0
     break_even_buffer_bps: float = 2.0
@@ -207,6 +228,9 @@ class RiskConfig:
     api_error_window_s: float = 60.0
     disconnect_halt_s: float = 10.0
     kill_switch_file: str = "KILL_SWITCH"
+    # RESEARCH-ONLY: ignore the consecutive-loss halt so offline replays can observe the
+    # full distribution of a losing strategy. Refused by the bot outside offline replay.
+    research_mode: bool = False
 
 
 @dataclass
@@ -221,6 +245,16 @@ class RecorderConfig:
     label_stop_bps: float = 8.0
     flush_interval_s: float = 1.0
     trades_jsonl: str = "data/trades.jsonl"
+    # Raw WebSocket event capture for exact replay (~3-6 GB/day gzipped at 30 symbols).
+    record_events: bool = True
+    events_dir: str = "data/events"
+
+
+@dataclass
+class V3Config:
+    """V3 (L2 research) serving settings. Research-only: refused in live mode."""
+    model_dir: str = "models/v3/v3_all"
+    threshold: float | None = None        # None -> threshold selected on the selection days
 
 
 @dataclass
@@ -240,6 +274,7 @@ class BotConfig:
     exit: ExitConfig = field(default_factory=ExitConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
+    v3: V3Config = field(default_factory=V3Config)
 
     def live_trading_enabled(self) -> bool:
         return (
@@ -272,8 +307,14 @@ class BotConfig:
             problems.append("execution.ttl_fallback must be 'skip' or 'taker_if_edge'")
         if self.execution.entry_mode not in ("maker_first", "taker"):
             problems.append("execution.entry_mode must be 'maker_first' or 'taker'")
-        if self.market_data.depth_mode not in ("partial", "diff"):
-            problems.append("market_data.depth_mode must be 'partial' or 'diff'")
+        if self.market_data.depth_mode not in ("partial", "diff", "bbo"):
+            problems.append("market_data.depth_mode must be 'partial', 'diff' or 'bbo'")
+        if self.exit.mode not in ("v1", "barrier"):
+            problems.append("exit.mode must be 'v1' or 'barrier'")
+        if self.strategy.predictor == "v2" and self.mode == "live":
+            problems.append("V2 predictor is not approved for live trading (no credible out-of-sample edge yet)")
+        if self.strategy.predictor == "v3" and self.mode == "live":
+            problems.append("V3 predictor is research-only and not approved for live trading")
         if self.entry.min_net_profit_usdt <= 0:
             problems.append("entry.min_net_profit_usdt must be positive")
         if self.mode == "live" and not self.dry_run and not self.live_trading_enabled():
@@ -282,6 +323,17 @@ class BotConfig:
                 f"enabled (need API keys and LIVE_TRADING_CONFIRM={LIVE_CONFIRM_PHRASE})"
             )
         return problems
+
+    def fingerprint(self) -> str:
+        """Stable hash of everything that can change trading behaviour (not secrets/paths)."""
+        import hashlib
+
+        d = self.to_dict()
+        for k in ("recorder", "exchange", "log_level"):
+            d.pop(k, None)
+        if d.get("v3") == asdict(V3Config()):
+            d.pop("v3")       # V3 settings at defaults do not change V1/V2 fingerprints (locked tests)
+        return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -293,6 +345,8 @@ class BotConfig:
 def _merge(dc: Any, overrides: dict[str, Any]) -> None:
     names = {f.name: f for f in fields(dc)}
     for key, value in overrides.items():
+        if key.startswith("_"):
+            continue  # comment keys in JSON configs
         if key not in names:
             raise KeyError(f"unknown config key {key!r} for {type(dc).__name__}")
         current = getattr(dc, key)

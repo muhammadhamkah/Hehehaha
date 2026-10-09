@@ -1,0 +1,11 @@
+# V3 L2 recorder image (public market data only; no API keys, no orders).
+#   docker build -f deploy/Dockerfile.recorder -t v3-recorder .
+#   docker run -d --restart=on-failure -v /data/l2:/data/l2 v3-recorder \
+#       --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT --no-depth20 --max-gb 95 --days 14
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir aiohttp numpy pandas zstandard
+COPY . .
+ENV PYTHONUNBUFFERED=1
+ENTRYPOINT ["python", "-m", "v3.recorder"]

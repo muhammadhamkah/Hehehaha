@@ -67,3 +67,12 @@ def test_staleness():
     b = make_book(ts=1000)
     assert not b.is_stale(1500, 2000)
     assert b.is_stale(5000, 2000)
+
+
+def test_history_conflation_for_tick_level_feeds():
+    b = OrderBook("X", history_len=600, history_interval_ms=100)
+    for i in range(2000):                       # 2000 updates over 10s (200/s)
+        b.apply_snapshot([(100.0 + (i % 3) * 0.01, 1.0)], [(100.05, 1.0)], i, local_ts_ms=i * 5)
+    assert len(b.history) == 100               # one state per 100ms bucket
+    assert b.history[-1].ts_ms == 1999 * 5     # latest state kept in its bucket
+    assert b.history[0].ts_ms // 100 == 0

@@ -19,8 +19,11 @@ from __future__ import annotations
 import json
 import logging
 import random
-from dataclasses import dataclass, field
+from array import array
+from dataclasses import dataclass
 from typing import Any
+
+import numpy as np
 
 from config import HORIZONS_S, BotConfig
 from data.database import Database
@@ -44,58 +47,100 @@ class PendingLabel:
     direction: int
     target_bps: float
     stop_bps: float
-    rets: dict[int, float | None] = field(default_factory=dict)
-    tp_long: int = 0
-    tp_short: int = 0
-    mfe_bps: float = 0.0
-    mae_bps: float = 0.0
-    last_ts: int = 0
+    plan_target_bps: float | None = None
+    plan_stop_bps: float | None = None
+    start_abs: int = 0          # first quote (absolute path index) seen after creation
 
-    def __post_init__(self) -> None:
-        self.long_tp = self.ask0 * (1 + self.target_bps / 1e4)
-        self.long_sl = self.ask0 * (1 - self.stop_bps / 1e4)
-        self.short_tp = self.bid0 * (1 - self.target_bps / 1e4)
-        self.short_sl = self.bid0 * (1 + self.stop_bps / 1e4)
+    def compute(self, ts: np.ndarray, bid: np.ndarray, ask: np.ndarray, complete: bool) -> dict[str, Any]:
+        """Labels from the quote path observed after the signal (vectorized, computed once).
 
-    def update(self, ts: int, bid: float, ask: float) -> bool:
-        """Feed a quote. Returns True once the label window is complete."""
-        if ts < self.t0:
-            return False
-        self.last_ts = ts
-        mid = 0.5 * (bid + ask)
-        elapsed = ts - self.t0
-        for h in HORIZONS_S:
-            if h not in self.rets and elapsed >= h * 1000:
-                # Only accept the quote if it arrived close to the horizon.
-                self.rets[h] = (mid - self.mid0) / self.mid0 * 1e4 if elapsed <= h * 1000 + HORIZON_TOLERANCE_MS else None
-        if self.tp_long == 0:
-            if bid >= self.long_tp:
-                self.tp_long = 1
-            elif bid <= self.long_sl:
-                self.tp_long = -1
-        if self.tp_short == 0:
-            if ask <= self.short_tp:
-                self.tp_short = 1
-            elif ask >= self.short_sl:
-                self.tp_short = -1
-        d = self.direction or 1
-        exc = (bid - self.ask0) / self.ask0 * 1e4 if d > 0 else (self.bid0 - ask) / self.bid0 * 1e4
-        self.mfe_bps = max(self.mfe_bps, exc)
-        self.mae_bps = min(self.mae_bps, exc)
-        return elapsed >= LABEL_SPAN_MS
-
-    def result(self, complete: bool) -> dict[str, Any]:
-        out: dict[str, Any] = {f"ret_{h}s": self.rets.get(h) for h in HORIZONS_S}
-        tp_pred = self.tp_long if self.direction > 0 else self.tp_short if self.direction < 0 else None
+        Semantics: horizon h uses the first quote with elapsed >= h (NULL if it arrived more
+        than HORIZON_TOLERANCE_MS late); barrier touches use the FIRST quote that crosses,
+        target checked before stop on the same quote; executable prices throughout.
+        """
+        out: dict[str, Any] = {f"ret_{h}s": None for h in HORIZONS_S}
+        tp_long = tp_short = tp_plan = 0
+        mfe = mae = 0.0
+        n = len(ts)
+        if n:
+            elapsed = ts - self.t0
+            mid = 0.5 * (bid + ask)
+            for h in HORIZONS_S:
+                i = int(np.searchsorted(elapsed, h * 1000, side="left"))
+                if i < n:
+                    out[f"ret_{h}s"] = (float((mid[i] - self.mid0) / self.mid0 * 1e4)
+                                        if elapsed[i] <= h * 1000 + HORIZON_TOLERANCE_MS else None)
+            tp_long = _first_touch(bid >= self.ask0 * (1 + self.target_bps / 1e4),
+                                   bid <= self.ask0 * (1 - self.stop_bps / 1e4))
+            tp_short = _first_touch(ask <= self.bid0 * (1 - self.target_bps / 1e4),
+                                    ask >= self.bid0 * (1 + self.stop_bps / 1e4))
+            d = self.direction
+            if self.plan_target_bps and self.plan_stop_bps and d:
+                entry = self.ask0 if d > 0 else self.bid0
+                mark = bid if d > 0 else ask
+                tp_px = entry * (1 + d * self.plan_target_bps / 1e4)
+                sl_px = entry * (1 - d * self.plan_stop_bps / 1e4)
+                tp_plan = _first_touch((mark - tp_px) * d >= 0, (mark - sl_px) * d <= 0)
+            exc = (bid - self.ask0) / self.ask0 * 1e4 if (d or 1) > 0 else (self.bid0 - ask) / self.bid0 * 1e4
+            mfe = max(0.0, float(exc.max()))
+            mae = min(0.0, float(exc.min()))
+        has_plan = bool(self.plan_target_bps and self.plan_stop_bps and self.direction)
         out.update(
-            tp_long=self.tp_long,
-            tp_short=self.tp_short,
-            tp_pred=tp_pred,
-            mfe_bps=self.mfe_bps,
-            mae_bps=self.mae_bps,
+            tp_long=tp_long,
+            tp_short=tp_short,
+            tp_pred=tp_long if self.direction > 0 else tp_short if self.direction < 0 else None,
+            tp_plan=tp_plan if has_plan else None,
+            mfe_bps=mfe,
+            mae_bps=mae,
             labeled=1 if complete else 2,
         )
         return out
+
+
+def _first_touch(hit_tp: np.ndarray, hit_sl: np.ndarray) -> int:
+    i_tp = int(np.argmax(hit_tp)) if hit_tp.any() else None
+    i_sl = int(np.argmax(hit_sl)) if hit_sl.any() else None
+    if i_tp is None and i_sl is None:
+        return 0
+    if i_sl is None or (i_tp is not None and i_tp <= i_sl):
+        return 1
+    return -1
+
+
+class _QuotePath:
+    """Per-symbol quote history since the oldest pending label (absolute indexing).
+
+    Typed buffers (array.array) so a label's window is a zero-copy numpy view instead of
+    a list -> ndarray conversion of ~10k quotes on busy symbols.
+    """
+
+    __slots__ = ("base", "ts", "bid", "ask")
+
+    def __init__(self) -> None:
+        self.base = 0
+        self.ts = array("q")
+        self.bid = array("d")
+        self.ask = array("d")
+
+    @property
+    def end(self) -> int:
+        return self.base + len(self.ts)
+
+    def arrays(self, start_abs: int, end_abs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        i, j = start_abs - self.base, end_abs - self.base
+        # Copies are cheap (contiguous memcpy) and avoid holding buffer exports that would
+        # block later in-place pruning of the arrays.
+        return (np.frombuffer(self.ts, dtype=np.int64)[i:j].copy(),
+                np.frombuffer(self.bid, dtype=np.float64)[i:j].copy(),
+                np.frombuffer(self.ask, dtype=np.float64)[i:j].copy())
+
+    def prune(self, keep_from_abs: int) -> None:
+        k = keep_from_abs - self.base
+        if k > 4096 and k > len(self.ts) // 2:
+            del self.ts[:k]
+            del self.bid[:k]
+            del self.ask[:k]
+            self.base = keep_from_abs
 
 
 class Recorder:
@@ -104,6 +149,7 @@ class Recorder:
         self.db = db
         self.rng = rng or random.Random()
         self.pending: dict[str, list[PendingLabel]] = {}
+        self.paths: dict[str, _QuotePath] = {}
         self._last_record_ms: dict[str, int] = {}
         self.n_recorded = 0
         self.n_labeled = 0
@@ -187,8 +233,10 @@ class Recorder:
         self.n_recorded += 1
         bid, ask = features.get("bid", 0.0), features.get("ask", 0.0)
         if bid > 0 and ask > 0:
+            path = self.paths.setdefault(symbol, _QuotePath())
             self.pending.setdefault(symbol, []).append(
-                PendingLabel(sid, symbol, now_ms, 0.5 * (bid + ask), bid, ask, pred.direction, lt, ls)
+                PendingLabel(sid, symbol, now_ms, 0.5 * (bid + ask), bid, ask, pred.direction, lt, ls,
+                             details.get("target_bps"), details.get("stop_bps"), start_abs=path.end)
             )
         return sid
 
@@ -197,33 +245,34 @@ class Recorder:
         lst = self.pending.get(symbol)
         if not lst or bid <= 0 or ask <= 0:
             return
-        keep = []
-        for p in lst:
-            if p.update(ts_ms, bid, ask):
-                self._finalize(p, complete=True)
-            else:
-                keep.append(p)
-        if keep:
-            self.pending[symbol] = keep
+        path = self.paths[symbol]
+        path.ts.append(ts_ms)
+        path.bid.append(bid)
+        path.ask.append(ask)
+        # Labels are created in time order, so the ready ones form a prefix.
+        while lst and ts_ms - lst[0].t0 >= LABEL_SPAN_MS:
+            p = lst.pop(0)
+            self._finalize(p, path, path.end, complete=True)
+        if lst:
+            path.prune(lst[0].start_abs)
         else:
             del self.pending[symbol]
+            del self.paths[symbol]
 
     def sweep(self, now_ms: int) -> None:
         """Finalize labels whose symbol stopped producing quotes."""
         for symbol in list(self.pending):
-            keep = []
-            for p in self.pending[symbol]:
-                if now_ms - p.t0 > LABEL_SPAN_MS + SWEEP_GRACE_MS:
-                    self._finalize(p, complete=False)
-                else:
-                    keep.append(p)
-            if keep:
-                self.pending[symbol] = keep
-            else:
+            lst = self.pending[symbol]
+            path = self.paths[symbol]
+            while lst and now_ms - lst[0].t0 > LABEL_SPAN_MS + SWEEP_GRACE_MS:
+                self._finalize(lst.pop(0), path, path.end, complete=False)
+            if not lst:
                 del self.pending[symbol]
+                del self.paths[symbol]
 
-    def _finalize(self, p: PendingLabel, complete: bool) -> None:
-        self.db.update("signals", "id", p.signal_id, p.result(complete))
+    def _finalize(self, p: PendingLabel, path: _QuotePath, end_abs: int, complete: bool) -> None:
+        ts, bid, ask = path.arrays(p.start_abs, end_abs)
+        self.db.update("signals", "id", p.signal_id, p.compute(ts, bid, ask, complete))
         self.n_labeled += 1
 
     def pending_symbols(self) -> set[str]:
@@ -231,9 +280,11 @@ class Recorder:
 
     def flush_all(self) -> None:
         for symbol in list(self.pending):
+            path = self.paths[symbol]
             for p in self.pending[symbol]:
-                self._finalize(p, complete=False)
+                self._finalize(p, path, path.end, complete=False)
         self.pending.clear()
+        self.paths.clear()
 
     # ------------------------------------------------------------------ raw data
     def record_scanner(self, now_ms: int, ranking: list) -> None:

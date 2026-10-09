@@ -1,8 +1,10 @@
 """Executed-trade (aggressor flow) features. Positive == aggressive buying."""
 from __future__ import annotations
 
+import numpy as np
+
 from market_data.tradeflow import TradeFlow
-from utils.mathx import clip, imbalance, median, safe_div
+from utils.mathx import clip, imbalance, safe_div
 
 
 def flow_features(flow: TradeFlow, now_ms: int, window_s: float) -> dict[str, float]:
@@ -43,16 +45,13 @@ def large_trade_imbalance(flow: TradeFlow, now_ms: int, window_s: float, mult: f
     sizes = flow.recent_sizes(now_ms, ref_window_s)
     if len(sizes) < 10:
         return 0.0, 0.0
-    thresh = median(sizes) * mult
-    start = now_ms - int(window_s * 1000)
-    big_buy = big_sell = tot = 0.0
-    for t in reversed(flow.trades):
-        if t.ts_ms <= start:
-            break
-        n = t.notional
-        tot += n
+    thresh = float(np.median(np.frombuffer(sizes, dtype=np.float64))) * mult
+    notionals, sells = flow.sides_and_sizes(now_ms, window_s)
+    big_buy = big_sell = 0.0
+    tot = sum(notionals)
+    for n, sell in zip(notionals, sells):
         if n >= thresh:
-            if t.is_buyer_maker:
+            if sell:
                 big_sell += n
             else:
                 big_buy += n

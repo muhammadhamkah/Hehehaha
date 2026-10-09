@@ -43,6 +43,9 @@ class StreamConnection:
         on_disconnect: StatusHandler | None = None,
         max_backoff_s: float = 30.0,
         max_age_s: float = 23 * 3600,
+        max_streams: int = 200,
+        silence_timeout_s: float = 10.0,
+        initial_backoff_s: float = 1.0,
     ) -> None:
         self.name = name
         self.url = f"{ws_base.rstrip('/')}/stream"
@@ -51,7 +54,13 @@ class StreamConnection:
         self.on_disconnect = on_disconnect
         self.max_backoff_s = max_backoff_s
         self.max_age_s = max_age_s
+        self.max_streams = max_streams
+        self.initial_backoff_s = initial_backoff_s
+        self.silence_timeout_s = silence_timeout_s
         self.streams: set[str] = set()
+        self.pending_acks: dict[int, tuple[str, list[str], float]] = {}
+        self.n_sub_errors = 0
+        self.n_silence_reconnects = 0
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ids = itertools.count(1)
         self._running = False
@@ -63,7 +72,12 @@ class StreamConnection:
 
     # ------------------------------------------------------------------ control
     async def set_streams(self, streams: Iterable[str]) -> None:
-        new = set(streams)
+        ordered = list(dict.fromkeys(streams))   # caller order = priority
+        if len(ordered) > self.max_streams:
+            log.error("ws[%s] %d streams requested, cap is %d per connection; dropping %d lowest-priority",
+                      self.name, len(ordered), self.max_streams, len(ordered) - self.max_streams)
+            ordered = ordered[: self.max_streams]
+        new = set(ordered)
         add = sorted(new - self.streams)
         remove = sorted(self.streams - new)
         self.streams = new
@@ -79,13 +93,15 @@ class StreamConnection:
                 chunk = streams[i : i + MAX_STREAMS_PER_MSG]
                 if self._ws is None or self._ws.closed:
                     return
-                await self._ws.send_str(json.dumps({"method": method, "params": chunk, "id": next(self._ids)}))
+                msg_id = next(self._ids)
+                self.pending_acks[msg_id] = (method, chunk, time.monotonic())
+                await self._ws.send_str(json.dumps({"method": method, "params": chunk, "id": msg_id}))
                 await asyncio.sleep(CONTROL_MSG_INTERVAL_S)
 
     # ------------------------------------------------------------------ loop
     async def run(self) -> None:
         self._running = True
-        backoff = 1.0
+        backoff = self.initial_backoff_s
         async with aiohttp.ClientSession(trust_env=True) as session:
             while self._running:
                 started = time.monotonic()
@@ -99,7 +115,7 @@ class StreamConnection:
                             self.on_connect(self.name)
                         if self.streams:
                             asyncio.ensure_future(self._control("SUBSCRIBE", sorted(self.streams)))
-                        backoff = 1.0
+                        backoff = self.initial_backoff_s
                         await self._read_loop(ws, started)
                 except asyncio.CancelledError:
                     raise
@@ -119,7 +135,17 @@ class StreamConnection:
                 backoff *= 2
 
     async def _read_loop(self, ws: aiohttp.ClientWebSocketResponse, started: float) -> None:
-        async for msg in ws:
+        while True:
+            # Silence watchdog: a socket can stay "open" (pings OK) while data stops.
+            timeout = self.silence_timeout_s if self.streams else None
+            try:
+                msg = await ws.receive(timeout=timeout)
+            except asyncio.TimeoutError:
+                self.n_silence_reconnects += 1
+                log.warning("ws[%s] no data for %.0fs with %d streams subscribed; reconnecting",
+                            self.name, self.silence_timeout_s, len(self.streams))
+                await ws.close()
+                break
             if msg.type == aiohttp.WSMsgType.TEXT:
                 ts = now_ms()
                 self.last_msg_ms = ts
@@ -127,22 +153,39 @@ class StreamConnection:
                 try:
                     payload = json.loads(msg.data)
                 except json.JSONDecodeError:
+                    log.warning("ws[%s] non-JSON message: %.200s", self.name, msg.data)
                     continue
-                if "stream" in payload and "data" in payload:
+                if isinstance(payload, dict) and "stream" in payload and "data" in payload:
                     try:
                         self.on_message(payload["stream"], payload["data"], ts)
                     except Exception:  # noqa: BLE001 - never kill the socket on a handler bug
                         log.exception("ws[%s] handler error for %s", self.name, payload.get("stream"))
-                elif payload.get("result") is None and "id" in payload:
-                    pass  # subscription ack
-                elif "error" in payload:
-                    log.error("ws[%s] control error: %s", self.name, payload["error"])
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                elif isinstance(payload, dict) and "id" in payload:
+                    self._on_control_response(payload)
+                else:
+                    log.warning("ws[%s] unexpected message: %.200s", self.name, msg.data)
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                              aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                log.info("ws[%s] socket closed (%s) code=%s reason=%r after %.0fs", self.name, msg.type.name,
+                         ws.close_code, msg.extra if msg.type == aiohttp.WSMsgType.CLOSE else ws.exception(),
+                         time.monotonic() - started)
                 break
             if time.monotonic() - started > self.max_age_s:
                 log.info("ws[%s] recycling connection (age limit)", self.name)
                 await ws.close()
                 break
+            now = time.monotonic()
+            for mid, (method, chunk, sent) in list(self.pending_acks.items()):
+                if now - sent > 10.0:
+                    log.warning("ws[%s] no ack for %s id=%d (%d streams)", self.name, method, mid, len(chunk))
+                    del self.pending_acks[mid]
+
+    def _on_control_response(self, payload: dict) -> None:
+        pending = self.pending_acks.pop(payload.get("id"), None)
+        if "error" in payload or payload.get("result") is not None:
+            self.n_sub_errors += 1
+            log.error("ws[%s] control request %s failed: %s", self.name,
+                      pending[0] if pending else payload.get("id"), payload.get("error", payload))
 
     async def stop(self) -> None:
         self._running = False

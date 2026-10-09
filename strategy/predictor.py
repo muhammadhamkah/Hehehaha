@@ -195,4 +195,4 @@ def build_predictor(cfg: StrategyConfig) -> BasePredictor:
     rule = RuleBasedPredictor(cfg)
     if cfg.predictor == "linear":
         return LinearModelPredictor(cfg.model_path, rule)
-    return rule
+    return rule   # "rule" and "v2" (V2 uses strategy.v2.SignalEngineV2; exits do not need a predictor)

@@ -67,9 +67,45 @@ def barrier_outcome(a: float, b: float, mu: float, sigma: float, horizon_s: floa
         pu, pd = pu / s, pd / s
     pm = 1.0 - pu - pd
 
-    # Interior nodes 1..m-1; node 0 = stop (-b), node m = target (+a).
     start = int(round(b / dx))
     start = min(max(start, 1), m - 1)
+    return _lattice_closed_form(m, start, steps, dt, dx, a, b, pu, pd, pm, horizon_s)
+
+
+def _lattice_closed_form(m: int, start: int, steps: int, dt: float, dx: float, a: float, b: float,
+                         pu: float, pd: float, pm: float, horizon_s: float) -> BarrierOutcome:
+    """Same lattice as the step-by-step propagation, solved with matrix algebra.
+
+    Q is the (m-1)x(m-1) transient transition matrix over interior nodes 1..m-1.
+      alive after n steps:      Q^n v
+      survival sum S:           sum_{k<n} Q^k v = (I - Q)^-1 (I - Q^n) v
+      P(target):                pu * S[top]      (one step from node m-1 into m)
+      P(stop):                  pd * S[bottom]   (one step from node 1 into 0)
+      E[min(tau, n)] * dt:      dt * sum(S)
+    """
+    n_int = m - 1
+    q = np.zeros((n_int, n_int))
+    idx = np.arange(n_int)
+    q[idx, idx] = pm
+    q[idx[1:], idx[:-1]] = pu          # move up: node i -> i+1 (column = from, row = to)
+    q[idx[:-1], idx[1:]] = pd          # move down
+    v = np.zeros(n_int)
+    v[start - 1] = 1.0
+    qn = np.linalg.matrix_power(q, steps)
+    alive = qn @ v
+    surv = np.linalg.solve(np.eye(n_int) - q, v - alive)
+    p_up = float(pu * surv[-1])
+    p_down = float(pd * surv[0])
+    p_timeout = float(alive.sum())
+    xs = -b + dx * np.arange(1, m)
+    ev = p_up * a - p_down * b + float((alive * xs).sum())
+    hold = float(dt * surv.sum())
+    return BarrierOutcome(p_up, p_down, p_timeout, ev, min(hold, horizon_s))
+
+
+def _lattice_iterative(m: int, start: int, steps: int, dt: float, dx: float, a: float, b: float,
+                       pu: float, pd: float, pm: float, horizon_s: float) -> BarrierOutcome:
+    """Reference implementation: explicit forward propagation (used by tests)."""
     mass = np.zeros(m + 1)
     mass[start] = 1.0
     p_up = p_down = 0.0
@@ -88,8 +124,7 @@ def barrier_outcome(a: float, b: float, mu: float, sigma: float, horizon_s: floa
         mass = new
     p_timeout = float(mass.sum())
     xs = -b + dx * np.arange(m + 1)
-    timeout_value = float((mass * xs).sum())
-    ev = p_up * a - p_down * b + timeout_value
+    ev = p_up * a - p_down * b + float((mass * xs).sum())
     hold = hold_acc + p_timeout * horizon_s
     return BarrierOutcome(float(p_up), float(p_down), p_timeout, float(ev), float(hold))
 

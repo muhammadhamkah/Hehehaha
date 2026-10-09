@@ -66,3 +66,33 @@ def test_thin_tape_dampens_score():
 def test_percentile_ranks():
     assert percentile_ranks([3, 1, 2]) == [1.0, 0.0, 0.5]
     assert percentile_ranks([1, 1]) == [0.5, 0.5]
+
+
+def test_closed_form_lattice_matches_iterative_reference():
+    import random
+
+    from strategy import barrier as B
+
+    rng = random.Random(5)
+    for _ in range(60):
+        a, b = rng.uniform(3, 60), rng.uniform(3, 30)
+        mu, sigma, T = rng.uniform(-1.5, 1.5), rng.uniform(0.5, 6), rng.choice([10, 30, 60])
+        width = a + b
+        m = rng.randint(4, 80)
+        dx = width / m
+        dt = dx * dx / (3 * sigma * sigma)
+        steps = max(1, int(math.ceil(T / dt)))
+        if steps > 2500:
+            continue          # barrier_outcome uses the infinite-horizon formula here
+        dt = T / steps
+        pu = min(max(sigma * sigma * dt / (2 * dx * dx) + mu * dt / (2 * dx), 0), 1)
+        pd = min(max(sigma * sigma * dt / (2 * dx * dx) - mu * dt / (2 * dx), 0), 1)
+        start = min(max(int(round(b / dx)), 1), m - 1)
+        assert pu + pd <= 1.0 + 1e-12
+        args = (m, start, steps, dt, dx, a, b, pu, pd, 1 - pu - pd, T)
+        fast, ref = B._lattice_closed_form(*args), B._lattice_iterative(*args)
+        assert math.isclose(fast.p_target, ref.p_target, abs_tol=1e-9)
+        assert math.isclose(fast.p_stop, ref.p_stop, abs_tol=1e-9)
+        assert math.isclose(fast.p_timeout, ref.p_timeout, abs_tol=1e-9)
+        assert math.isclose(fast.expected_value_bps, ref.expected_value_bps, abs_tol=1e-7)
+        assert math.isclose(fast.expected_hold_s, min(ref.expected_hold_s, T), rel_tol=1e-7, abs_tol=1e-7)

@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS signals (
     decision TEXT, rejection_reason TEXT,
     features_json TEXT, predicted_json TEXT,
     {_RET_COLS},
-    tp_long INTEGER, tp_short INTEGER, tp_pred INTEGER,
+    tp_long INTEGER, tp_short INTEGER, tp_pred INTEGER, tp_plan INTEGER,
     mfe_bps REAL, mae_bps REAL,
     label_target_bps REAL, label_stop_bps REAL,
     labeled INTEGER DEFAULT 0
@@ -96,6 +96,7 @@ class Database:
         self.flush_interval_s = flush_interval_s
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM signals").fetchone()
             self._next_signal_id = int(row[0]) + 1
         self._q: queue.Queue[tuple[str, Any] | None] = queue.Queue()
@@ -103,6 +104,14 @@ class Database:
         self._thread = threading.Thread(target=self._writer, name="db-writer", daemon=True)
         self._running = True
         self._thread.start()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add columns introduced after a database was created."""
+        have = {r[1] for r in conn.execute("PRAGMA table_info(signals)")}
+        for col, typ in (("tp_plan", "INTEGER"),):
+            if col not in have:
+                conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)

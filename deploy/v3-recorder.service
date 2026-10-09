@@ -1,0 +1,25 @@
+# systemd unit for the V3 L2 recorder (public market data only; no API keys, no orders).
+# Install:  sudo cp deploy/v3-recorder.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#           sudo systemctl enable --now v3-recorder
+# Logs:     journalctl -u v3-recorder -f        Health: <out>/_health/YYYYMMDD.jsonl
+[Unit]
+Description=V3 Binance USDT-M L2 recorder (research only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=recorder
+WorkingDirectory=/opt/hehehaha
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/hehehaha/.venv/bin/python -m v3.recorder --out /data/l2 --symbols BTCUSDT ETHUSDT SOLUSDT --no-depth20 --max-gb 95 --min-free-gb 10 --days 14
+# The recorder stops itself (cleanly, with a logged reason) before --max-gb or below --min-free-gb;
+# Restart=on-failure does not restart it after such a clean stop.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=3
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -51,7 +51,8 @@ class SyncStatus:
 
 
 class OrderBook:
-    def __init__(self, symbol: str, history_len: int = 600, max_levels: int = 1000) -> None:
+    def __init__(self, symbol: str, history_len: int = 600, max_levels: int = 1000,
+                 history_interval_ms: int = 0) -> None:
         self.symbol = symbol
         self.bids: dict[float, float] = {}
         self.asks: dict[float, float] = {}
@@ -61,6 +62,9 @@ class OrderBook:
         self.synced: bool = False
         self.max_levels = max_levels
         self.history: deque[BookState] = deque(maxlen=history_len)
+        # >0: conflate history into time buckets (latest state per bucket) so a fixed-length
+        # history spans a fixed time window regardless of update rate (tick-level L1 feeds).
+        self.history_interval_ms = history_interval_ms
         self._buffer: list[dict] = []
         self._prev_u: int | None = None
         self._sorted_cache: tuple[list[tuple[float, float]], list[tuple[float, float]]] | None = None
@@ -179,7 +183,7 @@ class OrderBook:
         b, a = self.sorted_levels()
         bid, bq = b[0]
         ask, aq = a[0]
-        self.history.append(
+        state = (
             BookState(
                 ts_ms=self.last_local_ts_ms,
                 bid=bid,
@@ -192,6 +196,11 @@ class OrderBook:
                 ask_depth10=sum(p * q for p, q in a[:10]),
             )
         )
+        iv = self.history_interval_ms
+        if iv and self.history and self.history[-1].ts_ms // iv == state.ts_ms // iv:
+            self.history[-1] = state
+        else:
+            self.history.append(state)
 
     # ------------------------------------------------------------------ queries
     def sorted_levels(self, n: int | None = None) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:

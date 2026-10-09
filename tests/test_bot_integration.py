@@ -32,8 +32,15 @@ def _bot(tmp_path):
 
 
 def _depth(bid, ts):
-    return {"E": ts, "u": ts, "b": [[f"{bid - i * 0.01:.2f}", "50"] for i in range(20)],
+    # Real Binance USDT-M <sym>@depth20@100ms payload shape.
+    return {"e": "depthUpdate", "E": ts, "T": ts - 2, "s": SYM, "U": ts * 10, "u": ts * 10 + 5,
+            "pu": ts * 10 - 1, "b": [[f"{bid - i * 0.01:.2f}", "50"] for i in range(20)],
             "a": [[f"{bid + 0.01 + i * 0.01:.2f}", "50"] for i in range(20)]}
+
+
+def _agg(ts, price, qty, m, a):
+    return {"e": "aggTrade", "E": ts + 1, "s": SYM, "a": a, "p": price, "q": qty, "f": a * 3,
+            "l": a * 3 + 2, "T": ts, "m": m}
 
 
 def _plan():
@@ -47,11 +54,11 @@ async def test_message_handling_entry_exit_and_trade_log(tmp_path):
     ts = bot.clock.now_ms()
     for i in range(30):
         bot._on_detail_msg(f"{SYM.lower()}@depth20@100ms", _depth(100.0, ts + i), ts + i)
-        bot._on_detail_msg(f"{SYM.lower()}@aggTrade",
-                           {"T": ts + i, "p": "100.01", "q": "1", "m": False, "a": i + 1}, ts + i)
+        bot._on_detail_msg(f"{SYM.lower()}@aggTrade", _agg(ts + i, "100.01", "1", False, i + 1), ts + i)
     book = bot.books[SYM]
     assert book.synced and book.best_bid == 100.0 and len(book.history) == 30
     assert len(bot.flows[SYM].trades) == 30
+    assert bot.feed.summary()["malformed_by_kind"] == {}
 
     # Signal evaluation runs end-to-end on the live structures (records a signal or not).
     res = bot.signals.evaluate(SYM, book, bot.flows[SYM], ts + 30, trading_enabled=True)
@@ -63,8 +70,7 @@ async def test_message_handling_entry_exit_and_trade_log(tmp_path):
 
     async def fill_soon():
         await asyncio.sleep(0.05)
-        bot._on_detail_msg(f"{SYM.lower()}@aggTrade",
-                           {"T": ts + 100, "p": "99.99", "q": "10", "m": True, "a": 1000}, ts + 100)
+        bot._on_detail_msg(f"{SYM.lower()}@aggTrade", _agg(ts + 100, "99.99", "10", True, 1000), ts + 100)
 
     asyncio.ensure_future(fill_soon())
     await bot._enter(sig)

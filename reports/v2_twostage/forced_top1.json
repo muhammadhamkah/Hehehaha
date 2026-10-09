@@ -1,0 +1,222 @@
+{
+ "direct_lightgbm_T20": {
+  "trades": 28,
+  "net_pnl": -4.523,
+  "expectancy": -0.16154,
+  "t_stat": -4.37,
+  "win_rate": 0.3214,
+  "profit_factor": 0.184,
+  "avg_winner": 0.1134,
+  "avg_loser": -0.2918,
+  "median_trade": -0.30098,
+  "max_drawdown": 4.6966,
+  "tp_before_sl_rate": 0.2857,
+  "avg_hold_s": 12.83,
+  "costs_per_trade": 0.1814,
+  "long_share": 0.036,
+  "targets_used": {
+   "20": 28
+  },
+  "large_move_rate": 0.7143,
+  "dir_acc_given_move": 0.6,
+  "sel_rows_flagged": 81
+ },
+ "direct_lightgbm_T25": {
+  "trades": 12,
+  "net_pnl": -2.6218,
+  "expectancy": -0.21848,
+  "t_stat": -3.93,
+  "win_rate": 0.1667,
+  "profit_factor": 0.129,
+  "avg_winner": 0.194,
+  "avg_loser": -0.301,
+  "median_trade": -0.30098,
+  "max_drawdown": 2.6218,
+  "tp_before_sl_rate": 0.1667,
+  "avg_hold_s": 7.3,
+  "costs_per_trade": 0.1827,
+  "long_share": 1.0,
+  "targets_used": {
+   "25": 12
+  },
+  "large_move_rate": 0.8333,
+  "dir_acc_given_move": 0.6,
+  "sel_rows_flagged": 45
+ },
+ "direct_xgboost_T20": {
+  "trades": 10,
+  "net_pnl": -1.3685,
+  "expectancy": -0.13685,
+  "t_stat": -2.04,
+  "win_rate": 0.4,
+  "profit_factor": 0.242,
+  "avg_winner": 0.1093,
+  "avg_loser": -0.301,
+  "median_trade": -0.30098,
+  "max_drawdown": 1.3685,
+  "tp_before_sl_rate": 0.3,
+  "avg_hold_s": 14.68,
+  "costs_per_trade": 0.1816,
+  "long_share": 0.3,
+  "targets_used": {
+   "20": 10
+  },
+  "large_move_rate": 0.7,
+  "dir_acc_given_move": 0.4286,
+  "sel_rows_flagged": 28
+ },
+ "direct_xgboost_T25": {
+  "trades": 9,
+  "net_pnl": -2.214,
+  "expectancy": -0.246,
+  "t_stat": -4.47,
+  "win_rate": 0.1111,
+  "profit_factor": 0.081,
+  "avg_winner": 0.194,
+  "avg_loser": -0.301,
+  "median_trade": -0.301,
+  "max_drawdown": 2.408,
+  "tp_before_sl_rate": 0.1111,
+  "avg_hold_s": 7.69,
+  "costs_per_trade": 0.1833,
+  "long_share": 1.0,
+  "targets_used": {
+   "25": 9
+  },
+  "large_move_rate": 1.0,
+  "dir_acc_given_move": 0.4444,
+  "sel_rows_flagged": 27
+ },
+ "direct_mlp_T20": {
+  "trades": 59,
+  "net_pnl": -9.3015,
+  "expectancy": -0.15765,
+  "t_stat": -6.15,
+  "win_rate": 0.322,
+  "profit_factor": 0.196,
+  "avg_winner": 0.1191,
+  "avg_loser": -0.2891,
+  "median_trade": -0.30089,
+  "max_drawdown": 9.4206,
+  "tp_before_sl_rate": 0.322,
+  "avg_hold_s": 12.38,
+  "costs_per_trade": 0.1808,
+  "long_share": 0.78,
+  "targets_used": {
+   "20": 59
+  },
+  "large_move_rate": 0.7288,
+  "dir_acc_given_move": 0.6047,
+  "sel_rows_flagged": 80
+ },
+ "direct_mlp_T25": {
+  "trades": 106,
+  "net_pnl": -15.7143,
+  "expectancy": -0.14825,
+  "t_stat": -7.1,
+  "win_rate": 0.2736,
+  "profit_factor": 0.256,
+  "avg_winner": 0.1868,
+  "avg_loser": -0.2744,
+  "median_trade": -0.29421,
+  "max_drawdown": 15.7143,
+  "tp_before_sl_rate": 0.2453,
+  "avg_hold_s": 17.57,
+  "costs_per_trade": 0.1814,
+  "long_share": 0.896,
+  "targets_used": {
+   "25": 106
+  },
+  "large_move_rate": 0.6509,
+  "dir_acc_given_move": 0.5797,
+  "sel_rows_flagged": 162
+ },
+ "twostage_lightgbm_T20": {
+  "trades": 1,
+  "net_pnl": -0.3149,
+  "expectancy": -0.31494,
+  "t_stat": null,
+  "win_rate": 0.0,
+  "profit_factor": 0.0,
+  "avg_winner": null,
+  "avg_loser": -0.3149,
+  "median_trade": -0.31494,
+  "max_drawdown": 0.3149,
+  "tp_before_sl_rate": 0.0,
+  "avg_hold_s": 0.72,
+  "costs_per_trade": 0.1949,
+  "long_share": 0.0,
+  "targets_used": {
+   "20": 1
+  },
+  "large_move_rate": 1.0,
+  "dir_acc_given_move": 0.0,
+  "sel_rows_flagged": 5
+ },
+ "twostage_lightgbm_T25": {
+  "trades": 3,
+  "net_pnl": -0.4081,
+  "expectancy": -0.13604,
+  "t_stat": -0.82,
+  "win_rate": 0.3333,
+  "profit_factor": 0.322,
+  "avg_winner": 0.194,
+  "avg_loser": -0.301,
+  "median_trade": -0.30104,
+  "max_drawdown": 0.6021,
+  "tp_before_sl_rate": 0.3333,
+  "avg_hold_s": 15.25,
+  "costs_per_trade": 0.188,
+  "long_share": 1.0,
+  "targets_used": {
+   "25": 3
+  },
+  "large_move_rate": 1.0,
+  "dir_acc_given_move": 1.0,
+  "sel_rows_flagged": 22
+ },
+ "twostage_xgboost_T20": {
+  "trades": 6,
+  "net_pnl": -0.9662,
+  "expectancy": -0.16103,
+  "t_stat": -1.82,
+  "win_rate": 0.3333,
+  "profit_factor": 0.198,
+  "avg_winner": 0.119,
+  "avg_loser": -0.301,
+  "median_trade": -0.30103,
+  "max_drawdown": 1.0852,
+  "tp_before_sl_rate": 0.3333,
+  "avg_hold_s": 6.41,
+  "costs_per_trade": 0.1821,
+  "long_share": 0.0,
+  "targets_used": {
+   "20": 6
+  },
+  "large_move_rate": 1.0,
+  "dir_acc_given_move": 0.3333,
+  "sel_rows_flagged": 21
+ },
+ "twostage_xgboost_T25": {
+  "trades": 3,
+  "net_pnl": -0.4081,
+  "expectancy": -0.13603,
+  "t_stat": -0.82,
+  "win_rate": 0.3333,
+  "profit_factor": 0.322,
+  "avg_winner": 0.194,
+  "avg_loser": -0.301,
+  "median_trade": -0.30103,
+  "max_drawdown": 0.6021,
+  "tp_before_sl_rate": 0.3333,
+  "avg_hold_s": 14.32,
+  "costs_per_trade": 0.188,
+  "long_share": 1.0,
+  "targets_used": {
+   "25": 3
+  },
+  "large_move_rate": 1.0,
+  "dir_acc_given_move": 1.0,
+  "sel_rows_flagged": 14
+ }
+}

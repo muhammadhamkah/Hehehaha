@@ -1,0 +1,9 @@
+{
+  "_comment": "For L1-only (top-of-book) archive data. Disables ONLY the three gates that require order-book depth, which are mis-specified when a single level is visible: depth within 10 bps, one-sided-book detection, and depth-withdrawal detection. Chosen a priori (before seeing results); nothing else is changed.",
+  "market_data": {"depth_mode": "bbo"},
+  "entry": {
+    "min_depth_usdt_within_10bps": 0.0,
+    "max_book_imbalance_abs": 1.01,
+    "min_liquidity_change": -1.01
+  }
+}

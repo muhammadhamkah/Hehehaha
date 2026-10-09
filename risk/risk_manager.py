@@ -89,7 +89,7 @@ class RiskManager:
             self.consecutive_losses = 0
         if self.daily_pnl <= -abs(self.rc.daily_loss_limit_usdt):
             self.halt("daily_loss_limit")
-        if self.consecutive_losses >= self.rc.max_consecutive_losses:
+        if self.consecutive_losses >= self.rc.max_consecutive_losses and not self.rc.research_mode:
             self.halt("max_consecutive_losses")
 
     def on_api_error(self, msg: str = "") -> None:
@@ -145,7 +145,7 @@ class RiskManager:
             return False, f"halted:{self.halt_reason}"
         if self.daily_pnl <= -abs(self.rc.daily_loss_limit_usdt):
             return False, "daily_loss_limit"
-        if self.consecutive_losses >= self.rc.max_consecutive_losses:
+        if self.consecutive_losses >= self.rc.max_consecutive_losses and not self.rc.research_mode:
             return False, "max_consecutive_losses"
         cutoff = now - 3_600_000
         while self.trade_times and self.trade_times[0] < cutoff:
